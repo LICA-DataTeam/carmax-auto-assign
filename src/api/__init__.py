@@ -1,5 +1,3 @@
-from src.api.routes import assign_router
+"""API package."""
 
-__all__ = [
-    "assign_router"
-]
+__all__ = []
