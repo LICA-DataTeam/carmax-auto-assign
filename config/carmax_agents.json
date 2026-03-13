@@ -1,0 +1,22 @@
+{
+    "teams": [
+        {
+            "team": "A",
+            "agents": [
+                {"agent_key": "i3gpqj30", "agent_name": "Angelo Hernaez", "target": 30, "min": 30, "max": 30, "active": "true"},
+                {"agent_key": "rljq27v2", "agent_name": "Philip Estoya", "target": 30, "min": 30, "max": 30, "active": "true"},
+                {"agent_key": "iq74g6mz", "agent_name": "Chris Soriano", "target": 30, "min": 30, "max": 30, "active": "true"},
+                {"agent_key": "td8ju6tn", "agent_name": "Mary Ann Magsino", "target": 30, "min": 30, "max": 30, "active": "true"}
+            ]
+        },
+        {
+            "team": "B",
+            "agents": [
+                {"agent_key": "vc7g0778", "agent_name": "Clark Casetorno", "target": 30, "min": 30, "max": 30, "active": "true"},
+                {"agent_key": "5a1esg4r", "agent_name": "Howard Tindan", "target": 30, "min": 30, "max": 30, "active": "true"},
+                {"agent_key": "ba6qhkwv", "agent_name": "Cheska Pavia", "target": 30, "min": 30, "max": 30, "active": "true"},
+                {"agent_key": "9dwj4y9q", "agent_name": "Louis Gab Du", "target": 30, "min": 30, "max": 30, "active": "true"}
+            ]
+        }
+    ]
+}
