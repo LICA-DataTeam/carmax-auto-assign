@@ -1,0 +1,48 @@
+{
+  "assignments": {
+    "string": {
+      "status": "assigned",
+      "conv_code": "string",
+      "agent_id": "i3gpqj30",
+      "reason": "round_robin",
+      "created_at": "2026-03-13T13:43:46.937176+08:00"
+    },
+    "123": {
+      "status": "already_assigned",
+      "conv_code": "123",
+      "agent_id": "string",
+      "reason": "incoming_agent_id",
+      "created_at": "2026-03-13T14:41:27.206751+08:00"
+    },
+    "1": {
+      "status": "assigned",
+      "conv_code": "1",
+      "agent_id": "rljq27v2",
+      "reason": "round_robin",
+      "created_at": "2026-03-13T14:41:38.434783+08:00"
+    },
+    "2": {
+      "status": "assigned",
+      "conv_code": "2",
+      "agent_id": "iq74g6mz",
+      "reason": "round_robin",
+      "created_at": "2026-03-13T14:41:51.123062+08:00"
+    }
+  },
+  "daily": {
+    "2026-03-13": {
+      "last_index": 2,
+      "counts": {
+        "i3gpqj30": 1,
+        "rljq27v2": 1,
+        "iq74g6mz": 1,
+        "td8ju6tn": 0,
+        "vc7g0778": 0,
+        "5a1esg4r": 0,
+        "ba6qhkwv": 0,
+        "9dwj4y9q": 0
+      },
+      "last_agent_id": "iq74g6mz"
+    }
+  }
+}
