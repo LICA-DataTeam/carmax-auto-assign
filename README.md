@@ -1,5 +1,14 @@
 # carmax-auto-assign API
 
+# TODO
+- [ ] Decide on persistence
+- [ ] Integrate BigQuery for logging and analytics
+- [ ] Deployment config (Setup Cloud Run)
+- [ ] Handle LiveAgent error payloads
+- [ ] Retry/backoff policy for LiveAgent API failures
+- [ ] Monitoring and alerting (errors, quota reached, outside hours)
+- [ ] Secure webhook (document secret usage and rotation)
+
 ## Flow
 1. Accepts HTTP request from CarMax LiveAgent automated rule:
     - **HTTP Body (Sample request)**:
