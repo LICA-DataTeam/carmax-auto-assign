@@ -144,25 +144,94 @@ def _select_round_robin(
     return None
 
 
-def assign_round_robin(
+def get_existing_assignment(conv_code: str) -> Optional[Dict[str, object]]:
+    with _STATE_LOCK:
+        state = _load_state()
+        assignments = state.setdefault("assignments", {})
+        return assignments.get(conv_code)
+
+
+def record_existing_assignment(
     *,
     conv_code: str,
-    incoming_agent_id: Optional[str],
+    agent_id: str,
+    reason: str,
     now: Optional[datetime] = None,
 ) -> Dict[str, object]:
     current = now.astimezone(ZoneInfo(TIMEZONE)) if now else datetime.now(ZoneInfo(TIMEZONE))
     with _STATE_LOCK:
         state = _load_state()
         assignments = state.setdefault("assignments", {})
+        record = {
+            "status": "already_assigned",
+            "conv_code": conv_code,
+            "agent_id": agent_id,
+            "reason": reason,
+            "created_at": current.isoformat(),
+        }
+        assignments[conv_code] = record
+        _save_state(state)
+    return record
 
+
+def plan_next_assignment(now: Optional[datetime] = None) -> Dict[str, object]:
+    current = now.astimezone(ZoneInfo(TIMEZONE)) if now else datetime.now(ZoneInfo(TIMEZONE))
+    if not is_within_window(current):
+        return {
+            "status": "outside_hours",
+            "agent_id": None,
+            "reason": "outside_time_window",
+        }
+
+    agents = [agent for agent in load_agents() if agent.active]
+    if not agents:
+        return {
+            "status": "no_eligible_agents",
+            "agent_id": None,
+            "reason": "no_active_agents",
+        }
+
+    with _STATE_LOCK:
+        state = _load_state()
+        day_key = _today_key(current)
+        day_state = _ensure_daily_state(state, day_key, [a.agent_id for a in agents])
+        counts = day_state.get("counts", {})
+        last_index = int(day_state.get("last_index", -1))
+
+    pick = _select_round_robin(agents, counts, last_index)
+    if pick is None:
+        return {
+            "status": "no_eligible_agents",
+            "agent_id": None,
+            "reason": "quota_reached",
+        }
+
+    next_index, chosen = pick
+    return {
+        "status": "candidate",
+        "agent_id": chosen.agent_id,
+        "reason": "round_robin",
+        "day_key": day_key,
+        "next_index": next_index,
+    }
+
+def commit_assignment(
+    *,
+    conv_code: str,
+    agent_id: str,
+    reason: str,
+    now: Optional[datetime] = None,
+    day_key: Optional[str] = None,
+    next_index: Optional[int] = None,
+) -> Dict[str, object]:
+    current = now.astimezone(ZoneInfo(TIMEZONE)) if now else datetime.now(ZoneInfo(TIMEZONE))
+    agents = [agent for agent in load_agents() if agent.active]
+    agent_ids = [a.agent_id for a in agents]
+    with _STATE_LOCK:
+        state = _load_state()
+        assignments = state.setdefault("assignments", {})
         existing = assignments.get(conv_code)
         if existing:
-            log_event(
-                logger,
-                "auto_assign_replay",
-                conv_code=conv_code,
-                agent_id=existing.get("agent_id"),
-            )
             return {
                 "status": "already_assigned",
                 "conv_code": conv_code,
@@ -170,94 +239,110 @@ def assign_round_robin(
                 "reason": "idempotent_replay",
             }
 
-        if incoming_agent_id:
-            record = {
-                "status": "already_assigned",
-                "conv_code": conv_code,
-                "agent_id": incoming_agent_id,
-                "reason": "incoming_agent_id",
-                "created_at": current.isoformat(),
-            }
-            assignments[conv_code] = record
-            _save_state(state)
-            log_event(
-                logger,
-                "auto_assign_incoming_agent",
-                conv_code=conv_code,
-                agent_id=incoming_agent_id,
-            )
-            return {
-                "status": "already_assigned",
-                "conv_code": conv_code,
-                "agent_id": incoming_agent_id,
-                "reason": "incoming_agent_id",
-            }
-
-        if not is_within_window(current):
-            log_event(
-                logger,
-                "auto_assign_outside_hours",
-                conv_code=conv_code,
-            )
-            return {
-                "status": "outside_hours",
-                "conv_code": conv_code,
-                "agent_id": None,
-                "reason": "outside_time_window",
-            }
-
-        agents = [agent for agent in load_agents() if agent.active]
-        if not agents:
-            return {
-                "status": "no_eligible_agents",
-                "conv_code": conv_code,
-                "agent_id": None,
-                "reason": "no_active_agents",
-            }
-
-        day_key = _today_key(current)
-        day_state = _ensure_daily_state(state, day_key, [a.agent_id for a in agents])
+        if day_key is None:
+            day_key = _today_key(current)
+        day_state = _ensure_daily_state(state, day_key, agent_ids)
         counts = day_state.get("counts", {})
-        last_index = int(day_state.get("last_index", -1))
 
-        pick = _select_round_robin(agents, counts, last_index)
-        if pick is None:
-            log_event(
-                logger,
-                "auto_assign_quota_reached",
-                conv_code=conv_code,
-            )
-            return {
-                "status": "no_eligible_agents",
-                "conv_code": conv_code,
-                "agent_id": None,
-                "reason": "quota_reached",
-            }
-
-        next_index, chosen = pick
-        counts[chosen.agent_id] = int(counts.get(chosen.agent_id, 0)) + 1
-        day_state["last_index"] = next_index
-        day_state["last_agent_id"] = chosen.agent_id
+        counts[agent_id] = int(counts.get(agent_id, 0)) + 1
+        if next_index is not None:
+            day_state["last_index"] = next_index
+            day_state["last_agent_id"] = agent_id
+        else:
+            try:
+                idx = agent_ids.index(agent_id)
+                day_state["last_index"] = idx
+                day_state["last_agent_id"] = agent_id
+            except ValueError:
+                pass
 
         record = {
             "status": "assigned",
             "conv_code": conv_code,
-            "agent_id": chosen.agent_id,
-            "reason": "round_robin",
+            "agent_id": agent_id,
+            "reason": reason,
             "created_at": current.isoformat(),
         }
         assignments[conv_code] = record
         _save_state(state)
+        return {
+            "status": "assigned",
+            "conv_code": conv_code,
+            "agent_id": agent_id,
+            "reason": reason,
+        }
+
+
+def assign_round_robin(
+    *,
+    conv_code: str,
+    incoming_agent_id: Optional[str],
+    now: Optional[datetime] = None,
+) -> Dict[str, object]:
+    current = now.astimezone(ZoneInfo(TIMEZONE)) if now else datetime.now(ZoneInfo(TIMEZONE))
+    existing = get_existing_assignment(conv_code)
+    if existing:
+        log_event(
+            logger,
+            "auto_assign_replay",
+            conv_code=conv_code,
+            agent_id=existing.get("agent_id"),
+        )
+        return {
+            "status": "already_assigned",
+            "conv_code": conv_code,
+            "agent_id": existing.get("agent_id"),
+            "reason": "idempotent_replay",
+        }
+
+    if incoming_agent_id:
+        record = record_existing_assignment(
+            conv_code=conv_code,
+            agent_id=incoming_agent_id,
+            reason="incoming_agent_id",
+            now=current,
+        )
+        log_event(
+            logger,
+            "auto_assign_incoming_agent",
+            conv_code=conv_code,
+            agent_id=incoming_agent_id,
+        )
+        return {
+            "status": "already_assigned",
+            "conv_code": conv_code,
+            "agent_id": record.get("agent_id"),
+            "reason": "incoming_agent_id",
+        }
+
+    plan = plan_next_assignment(now=current)
+    if plan.get("status") != "candidate":
+        status = plan.get("status")
+        reason = plan.get("reason")
+        if status == "outside_hours":
+            log_event(logger, "auto_assign_outside_hours", conv_code=conv_code)
+        if status == "no_eligible_agents" and reason == "quota_reached":
+            log_event(logger, "auto_assign_quota_reached", conv_code=conv_code)
+        return {
+            "status": status,
+            "conv_code": conv_code,
+            "agent_id": plan.get("agent_id"),
+            "reason": reason,
+        }
+
+    commit = commit_assignment(
+        conv_code=conv_code,
+        agent_id=str(plan.get("agent_id")),
+        reason=str(plan.get("reason") or "round_robin"),
+        now=current,
+        day_key=str(plan.get("day_key")),
+        next_index=plan.get("next_index"),
+    )
+    if commit.get("status") == "assigned":
         log_event(
             logger,
             "auto_assign_success",
             conv_code=conv_code,
-            agent_id=chosen.agent_id,
+            agent_id=commit.get("agent_id"),
         )
-
-        return {
-            "status": "assigned",
-            "conv_code": conv_code,
-            "agent_id": chosen.agent_id,
-            "reason": "round_robin",
-        }
+    return commit
