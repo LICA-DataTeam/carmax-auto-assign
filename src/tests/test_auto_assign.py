@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.api.services import auto_assign
+from src.api.services.auto_assign_store import reset_store_cache
 
 
 def _write_agents(path: Path, agent_ids: list[str]) -> None:
@@ -34,8 +35,10 @@ def _setup_env(tmp_path: Path, agent_ids: list[str], monkeypatch: pytest.MonkeyP
     config_path = tmp_path / "agents.json"
     state_path = tmp_path / "state.json"
     _write_agents(config_path, agent_ids)
+    monkeypatch.setenv("AUTO_ASSIGN_STORE", "file")
     monkeypatch.setenv(auto_assign.CONFIG_ENV, str(config_path))
-    monkeypatch.setenv(auto_assign.STATE_ENV, str(state_path))
+    monkeypatch.setenv("AUTO_ASSIGN_STATE_PATH", str(state_path))
+    reset_store_cache()
 
 
 def _now_in_window() -> datetime:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from src.api.utils.logging import get_logger, log_event
+from src.api.services.auto_assign_store import get_store
 
 
 MAX_ASSIGNMENTS_PER_AGENT = 30
@@ -17,9 +17,6 @@ TIMEZONE = "Asia/Manila"
 WINDOW_START_HOUR = 8
 WINDOW_START_MINUTE = 30
 CONFIG_ENV = "AUTO_ASSIGN_CONFIG_PATH"
-STATE_ENV = "AUTO_ASSIGN_STATE_PATH"
-
-_STATE_LOCK = threading.Lock()
 logger = get_logger(__name__)
 
 
@@ -39,13 +36,6 @@ def _config_path() -> Path:
     if override:
         return Path(override)
     return _repo_root() / "config" / "carmax_agents.json"
-
-
-def _state_path() -> Path:
-    override = os.getenv(STATE_ENV)
-    if override:
-        return Path(override)
-    return _repo_root() / "data" / "auto_assign_state.json"
 
 
 def _parse_active_flag(value: object) -> bool:
@@ -95,38 +85,6 @@ def _today_key(now: Optional[datetime] = None) -> str:
     return current.strftime("%Y-%m-%d")
 
 
-def _default_state() -> Dict[str, object]:
-    return {
-        "assignments": {},
-        "daily": {},
-    }
-
-
-def _load_state() -> Dict[str, object]:
-    path = _state_path()
-    if not path.exists():
-        return _default_state()
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return _default_state()
-
-
-def _save_state(state: Dict[str, object]) -> None:
-    path = _state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2, ensure_ascii=True), encoding="utf-8")
-
-
-def _ensure_daily_state(state: Dict[str, object], date_key: str, agent_ids: List[str]) -> Dict[str, object]:
-    daily = state.setdefault("daily", {})
-    day_state = daily.setdefault(date_key, {"last_index": -1, "counts": {}})
-    counts = day_state.setdefault("counts", {})
-    for agent_id in agent_ids:
-        counts.setdefault(agent_id, 0)
-    return day_state
-
-
 def _select_round_robin(
     agents: List[Agent],
     counts: Dict[str, int],
@@ -145,10 +103,8 @@ def _select_round_robin(
 
 
 def get_existing_assignment(conv_code: str) -> Optional[Dict[str, object]]:
-    with _STATE_LOCK:
-        state = _load_state()
-        assignments = state.setdefault("assignments", {})
-        return assignments.get(conv_code)
+    store = get_store()
+    return store.get_assignment(conv_code)
 
 
 def record_existing_assignment(
@@ -159,19 +115,14 @@ def record_existing_assignment(
     now: Optional[datetime] = None,
 ) -> Dict[str, object]:
     current = now.astimezone(ZoneInfo(TIMEZONE)) if now else datetime.now(ZoneInfo(TIMEZONE))
-    with _STATE_LOCK:
-        state = _load_state()
-        assignments = state.setdefault("assignments", {})
-        record = {
-            "status": "already_assigned",
-            "conv_code": conv_code,
-            "agent_id": agent_id,
-            "reason": reason,
-            "created_at": current.isoformat(),
-        }
-        assignments[conv_code] = record
-        _save_state(state)
-    return record
+    store = get_store()
+    return store.record_assignment(
+        conv_code=conv_code,
+        agent_id=agent_id,
+        reason=reason,
+        status="already_assigned",
+        now=current,
+    )
 
 
 def plan_next_assignment(now: Optional[datetime] = None) -> Dict[str, object]:
@@ -191,12 +142,11 @@ def plan_next_assignment(now: Optional[datetime] = None) -> Dict[str, object]:
             "reason": "no_active_agents",
         }
 
-    with _STATE_LOCK:
-        state = _load_state()
-        day_key = _today_key(current)
-        day_state = _ensure_daily_state(state, day_key, [a.agent_id for a in agents])
-        counts = day_state.get("counts", {})
-        last_index = int(day_state.get("last_index", -1))
+    store = get_store()
+    day_key = _today_key(current)
+    day_state = store.get_daily_state(day_key)
+    counts = dict(day_state.get("counts") or {})
+    last_index = int(day_state.get("last_index", -1))
 
     pick = _select_round_robin(agents, counts, last_index)
     if pick is None:
@@ -225,52 +175,18 @@ def commit_assignment(
     next_index: Optional[int] = None,
 ) -> Dict[str, object]:
     current = now.astimezone(ZoneInfo(TIMEZONE)) if now else datetime.now(ZoneInfo(TIMEZONE))
-    agents = [agent for agent in load_agents() if agent.active]
-    agent_ids = [a.agent_id for a in agents]
-    with _STATE_LOCK:
-        state = _load_state()
-        assignments = state.setdefault("assignments", {})
-        existing = assignments.get(conv_code)
-        if existing:
-            return {
-                "status": "already_assigned",
-                "conv_code": conv_code,
-                "agent_id": existing.get("agent_id"),
-                "reason": "idempotent_replay",
-            }
-
-        if day_key is None:
-            day_key = _today_key(current)
-        day_state = _ensure_daily_state(state, day_key, agent_ids)
-        counts = day_state.get("counts", {})
-
-        counts[agent_id] = int(counts.get(agent_id, 0)) + 1
-        if next_index is not None:
-            day_state["last_index"] = next_index
-            day_state["last_agent_id"] = agent_id
-        else:
-            try:
-                idx = agent_ids.index(agent_id)
-                day_state["last_index"] = idx
-                day_state["last_agent_id"] = agent_id
-            except ValueError:
-                pass
-
-        record = {
-            "status": "assigned",
-            "conv_code": conv_code,
-            "agent_id": agent_id,
-            "reason": reason,
-            "created_at": current.isoformat(),
-        }
-        assignments[conv_code] = record
-        _save_state(state)
-        return {
-            "status": "assigned",
-            "conv_code": conv_code,
-            "agent_id": agent_id,
-            "reason": reason,
-        }
+    store = get_store()
+    if day_key is None:
+        day_key = _today_key(current)
+    return store.commit_assignment(
+        conv_code=conv_code,
+        agent_id=agent_id,
+        reason=reason,
+        date_key=day_key,
+        next_index=next_index,
+        max_assignments=MAX_ASSIGNMENTS_PER_AGENT,
+        now=current,
+    )
 
 
 def assign_round_robin(

@@ -2,6 +2,7 @@ import pytest
 
 from src.api.routes import assign as assign_route
 from src.api.services import auto_assign
+from src.api.services.auto_assign_store import reset_store_cache
 
 
 class _Ticket:
@@ -12,6 +13,8 @@ class _Ticket:
 @pytest.mark.anyio
 async def test_existing_assignment_short_circuits(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("AUTO_ASSIGN_STORE", "file")
+    reset_store_cache()
 
     monkeypatch.setattr(
         auto_assign,
@@ -38,6 +41,8 @@ async def test_existing_assignment_short_circuits(monkeypatch: pytest.MonkeyPatc
 @pytest.mark.anyio
 async def test_remote_ticket_already_assigned(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("AUTO_ASSIGN_STORE", "file")
+    reset_store_cache()
     monkeypatch.setattr(auto_assign, "get_existing_assignment", lambda conv_code: None)
 
     recorded = {}
@@ -77,6 +82,8 @@ async def test_remote_ticket_already_assigned(monkeypatch: pytest.MonkeyPatch) -
 @pytest.mark.anyio
 async def test_liveagent_success_flow(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("AUTO_ASSIGN_STORE", "file")
+    reset_store_cache()
     monkeypatch.setattr(auto_assign, "get_existing_assignment", lambda conv_code: None)
 
     plan = {
@@ -128,6 +135,8 @@ async def test_liveagent_success_flow(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.anyio
 async def test_liveagent_failure_does_not_commit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("AUTO_ASSIGN_STORE", "file")
+    reset_store_cache()
     monkeypatch.setattr(auto_assign, "get_existing_assignment", lambda conv_code: None)
     monkeypatch.setattr(
         auto_assign,
