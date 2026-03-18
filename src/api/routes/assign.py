@@ -1,11 +1,11 @@
 import os
 from typing import Optional
 
-from fastapi import APIRouter, Form, Header, HTTPException
+from fastapi import APIRouter, Form, Header, HTTPException, Query
 from pydantic import BaseModel
 
 from src.api.models import AssignTicketRequest
-from src.api.services import auto_assign
+from src.api.services import auto_assign, run_auto_reassign
 from src.api.utils.logging import get_logger, log_event
 from src.integrations.liveagent import LiveAgentClient
 
@@ -23,6 +23,16 @@ class AutoAssignResponse(BaseModel):
     reason: Optional[str] = None
 
 
+def _require_secret(secret: Optional[str], *, conv_code: Optional[str] = None) -> None:
+    expected_secret = os.getenv("WEBHOOK_SECRET")
+    if not expected_secret:
+        log_event(logger, "auto_assign_secret_missing", conv_code=conv_code)
+        raise HTTPException(status_code=500, detail="Server misconfigured")
+    if not secret or secret != expected_secret:
+        log_event(logger, "auto_assign_unauthorized", conv_code=conv_code)
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 @router.post("/auto-assign", response_model=AutoAssignResponse)
 async def assign(
     conv_code: str = Form(...),
@@ -31,13 +41,7 @@ async def assign(
         None, alias="X-CMX-Auto-Assign-Secret"
     ),
 ) -> AutoAssignResponse:
-    expected_secret = os.getenv("WEBHOOK_SECRET")
-    if not expected_secret:
-        log_event(logger, "auto_assign_secret_missing", conv_code=conv_code)
-        raise HTTPException(status_code=500, detail="Server misconfigured")
-    if not x_cmx_auto_assign_secret or x_cmx_auto_assign_secret != expected_secret:
-        log_event(logger, "auto_assign_unauthorized", conv_code=conv_code)
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    _require_secret(x_cmx_auto_assign_secret, conv_code=conv_code)
     ticket = LiveAgentTicketWebHook(
         conv_code=conv_code,
         agent_id=agent_id
@@ -128,3 +132,21 @@ async def assign(
         agent_id=result.get("agent_id"),
         reason=result.get("reason"),
     )
+
+
+@router.post("/auto-reassign")
+async def auto_reassign(
+    limit: Optional[int] = Query(None),
+    x_cmx_auto_assign_secret: Optional[str] = Header(
+        None, alias="X-CMX-Auto-Assign-Secret"
+    ),
+) -> dict:
+    _require_secret(x_cmx_auto_assign_secret)
+    result = await run_auto_reassign(limit=limit)
+    log_event(
+        logger,
+        "auto_reassign_complete",
+        checked=result.get("checked"),
+        reassigned=result.get("reassigned"),
+    )
+    return result

@@ -89,14 +89,18 @@ def _select_round_robin(
     agents: List[Agent],
     counts: Dict[str, int],
     last_index: int,
+    exclude_agent_ids: Optional[set[str]] = None,
 ) -> Optional[Tuple[int, Agent]]:
     if not agents:
         return None
+    exclude_agent_ids = exclude_agent_ids or set()
     total = len(agents)
     start = (last_index + 1) % total if last_index >= 0 else 0
     for offset in range(total):
         idx = (start + offset) % total
         agent = agents[idx]
+        if agent.agent_id in exclude_agent_ids:
+            continue
         if counts.get(agent.agent_id, 0) < MAX_ASSIGNMENTS_PER_AGENT:
             return idx, agent
     return None
@@ -125,7 +129,11 @@ def record_existing_assignment(
     )
 
 
-def plan_next_assignment(now: Optional[datetime] = None) -> Dict[str, object]:
+def plan_next_assignment(
+    *,
+    now: Optional[datetime] = None,
+    exclude_agent_ids: Optional[set[str]] = None,
+) -> Dict[str, object]:
     current = now.astimezone(ZoneInfo(TIMEZONE)) if now else datetime.now(ZoneInfo(TIMEZONE))
     if not is_within_window(current):
         return {
@@ -148,7 +156,7 @@ def plan_next_assignment(now: Optional[datetime] = None) -> Dict[str, object]:
     counts = dict(day_state.get("counts") or {})
     last_index = int(day_state.get("last_index", -1))
 
-    pick = _select_round_robin(agents, counts, last_index)
+    pick = _select_round_robin(agents, counts, last_index, exclude_agent_ids=exclude_agent_ids)
     if pick is None:
         return {
             "status": "no_eligible_agents",
