@@ -233,9 +233,11 @@ class FileAutoAssignStore(AutoAssignStore):
             assignments = state.get("assignments") or {}
             results: List[Dict[str, object]] = []
             for record in assignments.values():
-                status = str(record.get("status") or "")
-                if status not in statuses:
-                    continue
+                ticket_status = record.get("ticket_status")
+                if ticket_status is not None:
+                    status = str(ticket_status or "")
+                    if status not in statuses:
+                        continue
                 reassign_count = int(record.get("reassign_count", 0) or 0)
                 if reassign_count >= max_reassign_count:
                     continue
@@ -485,11 +487,22 @@ class FirestoreAutoAssignStore(AutoAssignStore):
     ) -> List[Dict[str, object]]:
         query = (
             self._client.collection(self._assignments_collection)
-            .where("status", "in", statuses)
             .where("reassign_count", "<", max_reassign_count)
             .where("last_action_at", "<=", cutoff)
         )
-        return [doc.to_dict() for doc in query.stream()]
+        results = [doc.to_dict() for doc in query.stream()]
+        if not statuses:
+            return results
+        filtered = []
+        for record in results:
+            ticket_status = record.get("ticket_status")
+            if ticket_status is None:
+                filtered.append(record)
+                continue
+            status = str(ticket_status or "")
+            if status in statuses:
+                filtered.append(record)
+        return filtered
 
     def commit_reassign(
         self,

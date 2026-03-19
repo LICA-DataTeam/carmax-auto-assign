@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 from src.api.models import AssignTicketRequest
 from src.api.services import auto_assign
 from src.api.services.auto_assign_store import get_store
+from src.api.services.bq_logger import log_bq_event
 from src.api.utils.logging import get_logger, log_event
 from src.integrations.liveagent import LiveAgentClient
 
@@ -38,7 +40,12 @@ def _now() -> datetime:
     return datetime.now(ZoneInfo(TIMEZONE))
 
 
-async def run_auto_reassign(*, limit: Optional[int] = None) -> Dict[str, object]:
+async def run_auto_reassign(
+    *,
+    limit: Optional[int] = None,
+    request_id: Optional[str] = None,
+) -> Dict[str, object]:
+    request_id = request_id or uuid.uuid4().hex
     now = _now()
     cutoff = now - timedelta(minutes=REASSIGN_AFTER_MINUTES)
     statuses = _eligible_statuses()
@@ -53,6 +60,13 @@ async def run_auto_reassign(*, limit: Optional[int] = None) -> Dict[str, object]
         candidates = candidates[: max(0, int(limit))]
 
     results: List[Dict[str, object]] = []
+    log_bq_event(
+        "auto_reassign_request",
+        request_id=request_id,
+        limit=limit,
+        candidate_count=len(candidates),
+        cutoff_minutes=REASSIGN_AFTER_MINUTES,
+    )
     if not candidates:
         return {
             "status": "ok",
@@ -72,6 +86,12 @@ async def run_auto_reassign(*, limit: Optional[int] = None) -> Dict[str, object]
                 ticket = await client.get_ticket(conv_code)
             except Exception as exc:
                 log_event(logger, "auto_reassign_ticket_fetch_failed", conv_code=conv_code, error=str(exc))
+                log_bq_event(
+                    "auto_reassign_failed",
+                    request_id=request_id,
+                    conv_code=conv_code,
+                    reason="ticket_fetch_failed",
+                )
                 results.append(
                     {"conv_code": conv_code, "status": "failed", "reason": "ticket_fetch_failed"}
                 )
@@ -84,6 +104,14 @@ async def run_auto_reassign(*, limit: Optional[int] = None) -> Dict[str, object]
                     "auto_reassign_skip_status",
                     conv_code=conv_code,
                     status=ticket_status,
+                )
+                log_bq_event(
+                    "auto_reassign_decision",
+                    request_id=request_id,
+                    conv_code=conv_code,
+                    status="skipped",
+                    reason="status_not_eligible",
+                    ticket_status=ticket_status,
                 )
                 results.append(
                     {
@@ -100,6 +128,13 @@ async def run_auto_reassign(*, limit: Optional[int] = None) -> Dict[str, object]
                 exclude_agent_ids={str(current_agent)} if current_agent else None,
             )
             if plan.get("status") != "candidate":
+                log_bq_event(
+                    "auto_reassign_decision",
+                    request_id=request_id,
+                    conv_code=conv_code,
+                    status=plan.get("status"),
+                    reason=plan.get("reason"),
+                )
                 results.append(
                     {
                         "conv_code": conv_code,
@@ -113,6 +148,14 @@ async def run_auto_reassign(*, limit: Optional[int] = None) -> Dict[str, object]
                 agent_id=str(plan.get("agent_id")),
                 status=REASSIGN_STATUS or None,
             )
+            log_bq_event(
+                "auto_reassign_decision",
+                request_id=request_id,
+                conv_code=conv_code,
+                status="candidate",
+                agent_id=plan.get("agent_id"),
+                reason=plan.get("reason"),
+            )
 
             try:
                 await client.assign_ticket(conv_code, payload)
@@ -122,6 +165,12 @@ async def run_auto_reassign(*, limit: Optional[int] = None) -> Dict[str, object]
                     "auto_reassign_liveagent_failed",
                     conv_code=conv_code,
                     error=str(exc),
+                )
+                log_bq_event(
+                    "auto_reassign_failed",
+                    request_id=request_id,
+                    conv_code=conv_code,
+                    reason="liveagent_error",
                 )
                 results.append(
                     {"conv_code": conv_code, "status": "failed", "reason": "liveagent_error"}
@@ -138,6 +187,14 @@ async def run_auto_reassign(*, limit: Optional[int] = None) -> Dict[str, object]
                 max_reassign_count=REASSIGN_MAX_ATTEMPTS,
                 max_assignments=auto_assign.MAX_ASSIGNMENTS_PER_AGENT,
                 now=now,
+            )
+            log_bq_event(
+                "auto_reassign_success",
+                request_id=request_id,
+                conv_code=conv_code,
+                agent_id=commit.get("agent_id"),
+                reason=commit.get("reason"),
+                previous_agent_id=current_agent,
             )
             results.append(commit)
     finally:
