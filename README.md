@@ -1,14 +1,5 @@
 # carmax-auto-assign API
 
-# TODO
-- [ ] Decide on persistence
-- [ ] Integrate BigQuery for logging and analytics
-- [ ] Deployment config (Setup Cloud Run)
-- [ ] Handle LiveAgent error payloads
-- [ ] Retry/backoff policy for LiveAgent API failures
-- [ ] Monitoring and alerting (errors, quota reached, outside hours)
-- [ ] Secure webhook (document secret usage and rotation)
-
 ## Flow
 1. Accepts HTTP request from CarMax LiveAgent automated rule:
     - **HTTP Body (Sample request)**:
@@ -45,6 +36,14 @@
 ```json
 { "status": "assigned", "conv_code": "123", "agent_id": "i3gpqj30", "reason": "round_robin" }
 
+```
+
+### Setup
+Create a `.env` file and copy the contents of `.env.example`. Then supply the needed credentials.
+
+```bash
+touch .env
+cp .env.example .env # or cat .env.example > .env
 ```
 
 ### Install and run locally
