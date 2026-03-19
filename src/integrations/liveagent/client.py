@@ -29,7 +29,7 @@ class LiveAgentClient:
 
     async def assign_ticket(self, ticket_id: str, payload: AssignTicketRequest) -> LiveAgentTicket:
         resp = await self._client.put(
-            f"/ticket/{ticket_id}",
+            f"/tickets/{ticket_id}",
             headers=self._headers(),
             json=payload.model_dump(by_alias=True, exclude_none=True),
         )
