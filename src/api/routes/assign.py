@@ -1,10 +1,13 @@
 import os
+import time
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Form, Header, HTTPException, Query
 from pydantic import BaseModel
 
 from src.api.models import AssignTicketRequest
+from src.api.services.bq_logger import log_bq_event
 from src.api.services import auto_assign, run_auto_reassign
 from src.api.utils.logging import get_logger, log_event
 from src.integrations.liveagent import LiveAgentClient
@@ -46,10 +49,18 @@ async def assign(
         conv_code=conv_code,
         agent_id=agent_id
     )
+    request_id = uuid.uuid4().hex
+    start_time = time.perf_counter()
 
     log_event(
         logger,
         "auto_assign_request",
+        conv_code=ticket.conv_code,
+        incoming_agent_id=ticket.agent_id,
+    )
+    log_bq_event(
+        "auto_assign_request",
+        request_id=request_id,
         conv_code=ticket.conv_code,
         incoming_agent_id=ticket.agent_id,
     )
@@ -62,6 +73,14 @@ async def assign(
             "agent_id": existing.get("agent_id"),
             "reason": "idempotent_replay",
         }
+        log_bq_event(
+            "auto_assign_decision",
+            request_id=request_id,
+            conv_code=ticket.conv_code,
+            status="already_assigned",
+            agent_id=existing.get("agent_id"),
+            reason="idempotent_replay",
+        )
     else:
         client = LiveAgentClient()
         try:
@@ -79,6 +98,14 @@ async def assign(
                     "agent_id": remote_agent,
                     "reason": "ticket_already_assigned",
                 }
+                log_bq_event(
+                    "auto_assign_decision",
+                    request_id=request_id,
+                    conv_code=ticket.conv_code,
+                    status="already_assigned",
+                    agent_id=remote_agent,
+                    reason="ticket_already_assigned",
+                )
             else:
                 plan = auto_assign.plan_next_assignment()
                 if plan.get("status") != "candidate":
@@ -88,11 +115,27 @@ async def assign(
                         "agent_id": plan.get("agent_id"),
                         "reason": plan.get("reason"),
                     }
+                    log_bq_event(
+                        "auto_assign_decision",
+                        request_id=request_id,
+                        conv_code=ticket.conv_code,
+                        status=plan.get("status"),
+                        agent_id=plan.get("agent_id"),
+                        reason=plan.get("reason"),
+                    )
                 else:
                     assign_status = os.getenv("LIVEAGENT_ASSIGN_STATUS", "N").strip()
                     payload = AssignTicketRequest(
                         agent_id=str(plan.get("agent_id")),
                         status=assign_status or "N",
+                    )
+                    log_bq_event(
+                        "auto_assign_decision",
+                        request_id=request_id,
+                        conv_code=ticket.conv_code,
+                        status="candidate",
+                        agent_id=plan.get("agent_id"),
+                        reason=plan.get("reason"),
                     )
                     await client.assign_ticket(ticket.conv_code, payload)
                     result = auto_assign.commit_assignment(
@@ -118,6 +161,19 @@ async def assign(
         finally:
             await client.close()
 
+    latency_ms = int((time.perf_counter() - start_time) * 1000)
+    outcome_event = "auto_assign_success"
+    if result.get("status") not in {"assigned", "already_assigned"}:
+        outcome_event = "auto_assign_failed"
+    log_bq_event(
+        outcome_event,
+        request_id=request_id,
+        conv_code=ticket.conv_code,
+        status=result.get("status"),
+        agent_id=result.get("agent_id"),
+        reason=result.get("reason"),
+        latency_ms=latency_ms,
+    )
     log_event(
         logger,
         "auto_assign_response",
@@ -142,10 +198,17 @@ async def auto_reassign(
     ),
 ) -> dict:
     _require_secret(x_cmx_auto_assign_secret)
-    result = await run_auto_reassign(limit=limit)
+    request_id = uuid.uuid4().hex
+    result = await run_auto_reassign(limit=limit, request_id=request_id)
     log_event(
         logger,
         "auto_reassign_complete",
+        checked=result.get("checked"),
+        reassigned=result.get("reassigned"),
+    )
+    log_bq_event(
+        "auto_reassign_complete",
+        request_id=request_id,
         checked=result.get("checked"),
         reassigned=result.get("reassigned"),
     )
