@@ -19,6 +19,13 @@ WINDOW_START_MINUTE = 30
 CONFIG_ENV = "AUTO_ASSIGN_CONFIG_PATH"
 logger = get_logger(__name__)
 
+AGENTS_SOURCE_ENV = "AGENTS_SOURCE"
+AGENTS_FIRESTORE_COLLECTION_ENV = "FIRESTORE_COLLECTION_AGENT_CONFIG"  # default: app_config
+AGENTS_FIRESTORE_DOC_ENV = "FIRESTORE_DOC_AGENT_CONFIG"  # default: carmax_agents
+FIRESTORE_PROJECT_ENV = "FIRESTORE_PROJECT_ID"
+FIRESTORE_DATABASE_ENV = "FIRESTORE_DATABASE_ID"
+FIRESTORE_CREDENTIALS_ENV = "CREDENTIALS"
+
 
 @dataclass(frozen=True)
 class Agent:
@@ -45,20 +52,92 @@ def _parse_active_flag(value: object) -> bool:
         return value.strip().lower() in {"true", "1", "yes", "y"}
     return bool(value)
 
-
-def load_agents() -> List[Agent]:
+def _load_agents_payload_from_file() -> Dict[str, object]:
     path = _config_path()
     if not path.exists():
         raise FileNotFoundError(f"Agent config not found: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def _load_agents_payload_from_firestore() -> Dict[str, object]:
+    try:
+        from google.cloud import firestore
+        from google.oauth2 import service_account
+    except ImportError as exc:
+        raise RuntimeError("google-cloud-firestore is required for Firestore agent config") from exc
+
+    creds_raw = os.getenv(FIRESTORE_CREDENTIALS_ENV, "").strip()
+    credentials = None
+    project_id = os.getenv(FIRESTORE_PROJECT_ENV, "").strip() or None
+
+    if creds_raw:
+        info = None
+        if creds_raw.startswith("{"):
+            info = json.loads(creds_raw)
+        else:
+            creds_path = Path(creds_raw)
+            if creds_path.exists():
+                info = json.loads(creds_path.read_text(encoding="utf-8"))
+        if info:
+            credentials = service_account.Credentials.from_service_account_info(info)
+            project_id = project_id or info.get("project_id")
+
+    database_id = os.getenv(FIRESTORE_DATABASE_ENV, "(default)").strip() or "(default)"
+    client = firestore.Client(
+        project=project_id or None,
+        credentials=credentials,
+        database=database_id,
+    )
+
+    collection_name = os.getenv(AGENTS_FIRESTORE_COLLECTION_ENV, "app_config").strip() or "app_config"
+    doc_id = os.getenv(AGENTS_FIRESTORE_DOC_ENV, "carmax_agents").strip() or "carmax_agents"
+
+    snap = client.collection(collection_name).document(doc_id).get()
+    if not snap.exists:
+        raise FileNotFoundError(f"Firestore agent config not found: {collection_name}/{doc_id}")
+
+    payload = snap.to_dict() or {}
+    if not isinstance(payload, dict):
+        raise ValueError("Firestore agent config document must be an object")
+    return payload
+
+
+def _parse_agents_payload(payload: Dict[str, object], *, source: str) -> List[Agent]:
     teams = payload.get("teams") or []
+    if not isinstance(teams, list):
+        raise ValueError("Agent config 'teams' must be a list")
+
     agents: List[Agent] = []
-    for team in teams:
-        for item in team.get("agents") or []:
+    seen_agent_ids: set[str] = set()
+
+    for team_idx, team in enumerate(teams):
+        if not isinstance(team, dict):
+            raise ValueError(f"Team entry at index {team_idx} must be an object")
+
+        team_agents = team.get("agents") or []
+        if not isinstance(team_agents, list):
+            raise ValueError(f"Team entry at index {team_idx} has invalid 'agents' list")
+
+        for agent_idx, item in enumerate(team_agents):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"Agent entry at team index {team_idx}, agent index {agent_idx} must be an object"
+                )
+
             agent_id = str(item.get("agent_key") or "").strip()
-            agent_name = str(item.get("agent_name") or "").strip()
             if not agent_id:
-                continue
+                raise ValueError(
+                    f"Missing required 'agent_key' at team index {team_idx}, agent index {agent_idx}"
+                )
+            if agent_id in seen_agent_ids:
+                raise ValueError(f"Duplicate agent_key found: {agent_id}")
+            seen_agent_ids.add(agent_id)
+
+            agent_name = str(item.get("agent_name") or "").strip()
+            if not agent_name:
+                raise ValueError(
+                    f"Missing required 'agent_name' for agent_key '{agent_id}'"
+                )
+
             agents.append(
                 Agent(
                     agent_id=agent_id,
@@ -66,7 +145,21 @@ def load_agents() -> List[Agent]:
                     active=_parse_active_flag(item.get("active", True)),
                 )
             )
+
+    if not agents:
+        log_event(logger, "auto_assign_agents_empty", source=source)
     return agents
+
+
+def load_agents() -> List[Agent]:
+    source = os.getenv(AGENTS_SOURCE_ENV, "file").strip().lower()
+
+    if source == "firestore":
+        payload = _load_agents_payload_from_firestore()
+    else:
+        payload = _load_agents_payload_from_file()
+
+    return _parse_agents_payload(payload, source=source)
 
 
 def is_within_window(now: Optional[datetime] = None) -> bool:
