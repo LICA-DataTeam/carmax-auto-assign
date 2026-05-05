@@ -1,5 +1,8 @@
 # carmax-auto-assign API
 
+## Configuration
+- To add an agent or a new team, edit `config/carmax_agents.json`
+
 ## Flow
 1. Accepts HTTP request from CarMax LiveAgent automated rule:
     - **HTTP Body (Sample request)**:

@@ -18,6 +18,12 @@
                 {"agent_key": "ba6qhkwv", "agent_name": "Cheska Pavia", "target": 30, "min": 30, "max": 30, "active": "true"},
                 {"agent_key": "x1bgw6q2", "agent_name": "Mark Castro", "target": 30, "min": 30, "max": 30, "active": "true"}
             ]
+        },
+        {
+            "team": "C",
+            "agents": [
+                {"agent_key": "1z2hm98p", "agent_name": "Kent Viado", "target": 30, "min": 30, "max": 30, "active": "true"}
+            ]
         }
     ]
 }
