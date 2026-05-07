@@ -1,7 +1,31 @@
 # carmax-auto-assign API
 
 ## Configuration
-- To add an agent or a new team, edit `config/carmax_agents.json`
+- To add an agent or a new team, you have two options:
+
+### Option 1 (via file)
+- Edit `config/carmax_agents.json`.
+
+### Option 2 (via admin)
+- Click `Authorize` via Swagger docs (`/docs`)
+- Paste the bearer token
+- Get the current version by making a `GET` request to `/admin/agents`.
+- Copy the version
+- Create agent: Execute `POST /admin/agents`
+- Use body like:
+```json
+{
+  "team": "Team C",
+  "agent_key": "abc123xy",
+  "agent_name": "Jane Doe",
+  "active": true,
+  "expected_version": 12,
+  "change_reason": "Add new support agent",
+  "target": 30,
+  "min": 30,
+  "max": 30
+}
+```
 
 ## Flow
 1. Accepts HTTP request from CarMax LiveAgent automated rule:
