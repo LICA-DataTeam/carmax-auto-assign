@@ -75,6 +75,9 @@ def test_admin_create_agent_success(monkeypatch) -> None:
             "agent_key": "a1",
             "agent_name": "A1",
             "active": True,
+            "target": 30,
+            "min": 30,
+            "max": 30,
             "expected_version": 1,
             "change_reason": "add",
         },
@@ -99,7 +102,14 @@ def test_admin_patch_agent_version_conflict(monkeypatch) -> None:
     response = client.patch(
         "/admin/agents/a1",
         headers={"Authorization": "Bearer token-123"},
-        json={"expected_version": 1, "change_reason": "rename", "agent_name": "A1-new"},
+        json={
+            "expected_version": 1,
+            "change_reason": "rename",
+            "agent_name": "A1-new",
+            "target": 30,
+            "min": 30,
+            "max": 30,
+        },
     )
     assert response.status_code == 409
 
@@ -143,6 +153,9 @@ def test_admin_create_agent_validation_error(monkeypatch) -> None:
             "agent_key": "a1",
             "agent_name": "A1",
             "active": True,
+            "target": 30,
+            "min": 30,
+            "max": 30,
             "expected_version": 1,
             "change_reason": "add",
         },
@@ -182,6 +195,9 @@ def test_admin_create_agent_uses_mapped_bearer_actor(monkeypatch) -> None:
             "agent_key": "a1",
             "agent_name": "A1",
             "active": True,
+            "target": 30,
+            "min": 30,
+            "max": 30,
             "expected_version": 1,
             "change_reason": "add",
         },

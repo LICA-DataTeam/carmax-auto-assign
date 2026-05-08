@@ -28,9 +28,9 @@ class AgentCreateRequest(BaseModel):
     active: bool = True
     expected_version: int = Field(..., ge=0)
     change_reason: str = Field(..., min_length=1)
-    target: Optional[int] = None
-    min: Optional[int] = None
-    max: Optional[int] = None
+    target: int = Field(..., ge=0)
+    min: int = Field(..., ge=0)
+    max: int = Field(..., ge=0)
 
 
 class AgentUpdateRequest(BaseModel):
@@ -39,9 +39,9 @@ class AgentUpdateRequest(BaseModel):
     team: Optional[str] = None
     agent_name: Optional[str] = None
     active: Optional[bool] = None
-    target: Optional[int] = None
-    min: Optional[int] = None
-    max: Optional[int] = None
+    target: int = Field(..., ge=0)
+    min: int = Field(..., ge=0)
+    max: int = Field(..., ge=0)
 
 
 class AgentDeleteRequest(BaseModel):
@@ -272,6 +272,9 @@ def admin_ui(actor: str = Depends(_admin_actor)) -> str:
     <input id='createTeam' placeholder='Team' />
     <input id='createKey' placeholder='Agent key' />
     <input id='createName' placeholder='Agent name' />
+    <input id='createTarget' type='number' placeholder='Target' />
+    <input id='createMin' type='number' placeholder='Min' />
+    <input id='createMax' type='number' placeholder='Max' />
     <input id='createVersion' type='number' placeholder='Expected version' />
     <input id='createReason' placeholder='Change reason' />
     <button onclick='createAgent()'>Create</button>
@@ -281,6 +284,9 @@ def admin_ui(actor: str = Depends(_admin_actor)) -> str:
     <h3>Update Agent</h3>
     <input id='updateKey' placeholder='Agent key' />
     <input id='updateName' placeholder='New name (optional)' />
+    <input id='updateTarget' type='number' placeholder='Target' />
+    <input id='updateMin' type='number' placeholder='Min' />
+    <input id='updateMax' type='number' placeholder='Max' />
     <input id='updateVersion' type='number' placeholder='Expected version' />
     <input id='updateReason' placeholder='Change reason' />
     <button onclick='updateAgent()'>Update</button>
@@ -327,6 +333,9 @@ def admin_ui(actor: str = Depends(_admin_actor)) -> str:
           agent_key: document.getElementById('createKey').value,
           agent_name: document.getElementById('createName').value,
           active: true,
+          target: Number(document.getElementById('createTarget').value),
+          min: Number(document.getElementById('createMin').value),
+          max: Number(document.getElementById('createMax').value),
           expected_version: Number(document.getElementById('createVersion').value),
           change_reason: document.getElementById('createReason').value
         }));
@@ -337,6 +346,9 @@ def admin_ui(actor: str = Depends(_admin_actor)) -> str:
       try {
         write(await api('/admin/agents/' + encodeURIComponent(key), 'PATCH', {
           agent_name: document.getElementById('updateName').value || null,
+          target: Number(document.getElementById('updateTarget').value),
+          min: Number(document.getElementById('updateMin').value),
+          max: Number(document.getElementById('updateMax').value),
           expected_version: Number(document.getElementById('updateVersion').value),
           change_reason: document.getElementById('updateReason').value
         }));

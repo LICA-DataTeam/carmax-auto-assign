@@ -210,9 +210,9 @@ def create_agent(
     expected_version: int,
     actor: str,
     change_reason: str,
-    target: Optional[int] = None,
-    min_value: Optional[int] = None,
-    max_value: Optional[int] = None,
+    target: int,
+    min_value: int,
+    max_value: int,
 ) -> AgentMutationResult:
     team_name = team.strip()
     normalized_key = agent_key.strip()
@@ -257,13 +257,10 @@ def create_agent(
             "agent_key": normalized_key,
             "agent_name": normalized_name,
             "active": bool(active),
+            "target": int(target),
+            "min": int(min_value),
+            "max": int(max_value),
         }
-        if target is not None:
-            agent["target"] = int(target)
-        if min_value is not None:
-            agent["min"] = int(min_value)
-        if max_value is not None:
-            agent["max"] = int(max_value)
         team_entry.setdefault("agents", []).append(agent)
 
         _validate_payload(updated)
@@ -305,9 +302,9 @@ def update_agent(
     team: Optional[str] = None,
     agent_name: Optional[str] = None,
     active: Optional[bool] = None,
-    target: Optional[int] = None,
-    min_value: Optional[int] = None,
-    max_value: Optional[int] = None,
+    target: int,
+    min_value: int,
+    max_value: int,
 ) -> AgentMutationResult:
     normalized_key = target_agent_key.strip()
     if not normalized_key:
@@ -370,12 +367,9 @@ def update_agent(
             agent["agent_name"] = normalized_name
         if active is not None:
             agent["active"] = bool(active)
-        if target is not None:
-            agent["target"] = int(target)
-        if min_value is not None:
-            agent["min"] = int(min_value)
-        if max_value is not None:
-            agent["max"] = int(max_value)
+        agent["target"] = int(target)
+        agent["min"] = int(min_value)
+        agent["max"] = int(max_value)
 
         _validate_payload(updated)
         new_version = current_version + 1

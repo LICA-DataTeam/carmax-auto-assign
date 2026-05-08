@@ -39,6 +39,7 @@ async def test_auto_reassign_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_pat
     _write_agents(config_path, ["a1", "b2"])
 
     monkeypatch.setenv("AUTO_ASSIGN_STORE", "file")
+    monkeypatch.setenv(auto_assign.AGENTS_SOURCE_ENV, "file")
     monkeypatch.setenv(auto_assign.CONFIG_ENV, str(config_path))
     monkeypatch.setenv("AUTO_ASSIGN_STATE_PATH", str(state_path))
     monkeypatch.setenv("REASSIGN_AFTER_MINUTES", "10")
@@ -46,8 +47,11 @@ async def test_auto_reassign_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_pat
     monkeypatch.setenv("REASSIGN_ELIGIBLE_STATUSES", "C")
     reset_store_cache()
 
+    fixed_now = datetime(2026, 3, 13, 9, 0, tzinfo=ZoneInfo("Asia/Manila"))
+    monkeypatch.setattr("src.api.services.auto_reassign._now", lambda: fixed_now)
+
     store = get_store()
-    old_time = datetime.now(ZoneInfo("Asia/Manila")) - timedelta(minutes=11)
+    old_time = fixed_now - timedelta(minutes=11)
     store.record_assignment(
         conv_code="c1",
         agent_id="a1",
