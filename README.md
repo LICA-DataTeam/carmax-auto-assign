@@ -47,7 +47,7 @@
         - `status: "already_assigned"`
 
 5. **Time Window**
-    - Runs from **08:30 to 24:00 (Asia/Manila)**.
+    - Runs from **08:30 to 17:30 (Asia/Manila)**.
     - Outside time window, return:
         - `status: "outside_hours"`
 
