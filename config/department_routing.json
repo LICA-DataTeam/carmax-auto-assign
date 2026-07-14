@@ -1,0 +1,40 @@
+{
+    "departments": {
+        "o6woli37": {"label": "CarMax AutoCenter", "mode": "full_pool", "agent_keys": [], "active": true},
+        "xra8zm67": {"label": "CarMax Carmona", "mode": "full_pool", "agent_keys": [], "active": true},
+        "mqemg9w7": {"label": "CMC - Angelo Hernaez", "mode": "direct", "agent_keys": ["i3gpqj30"], "active": true},
+        "p1ivd5m8": {
+            "label": "CMC - FB Page",
+            "mode": "team_pool",
+            "agent_keys": ["02zmb2py", "5xueee4s", "rljq27v2", "x1bgw6q2"],
+            "active": true,
+            "owner_overrides": {
+                "Carmax Authorized Agent - Luigi Elumba": "02zmb2py",
+                "Carmax Authorized Agent - Luke B Hernaez": "5xueee4s",
+                "Carmax Authorized Agent - Kent Viado": "rljq27v2",
+                "Carmax Authorized Agent - Mark john Castro": "x1bgw6q2"
+            }
+        },
+        "b7k6o20i": {
+            "label": "CMC - Nolly and Roldan",
+            "mode": "team_pool",
+            "agent_keys": ["aro6c72e", "usrs69tc"],
+            "active": true,
+            "owner_overrides": {
+                "Carmax Authorized Agent-Roldan": "aro6c72e",
+                "CarMax Auto Dealership": "usrs69tc",
+                "Carmax Authorized Agent - Nolly Quintanilla": "usrs69tc"
+            }
+        },
+        "q1h4yk8b": {
+            "label": "CMC - Raf and Monique",
+            "mode": "team_pool",
+            "agent_keys": ["1z2hm98p", "iq74g6mz"],
+            "active": true,
+            "owner_overrides": {
+                "Carmax carmona - john rafael malubag": "1z2hm98p",
+                "Carmax carmona - monique aguinaldo": "iq74g6mz"
+            }
+        }
+    }
+}
