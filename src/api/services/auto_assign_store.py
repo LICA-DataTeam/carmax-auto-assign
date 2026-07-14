@@ -18,6 +18,7 @@ logger = get_logger(__name__)
 TIMEZONE = "Asia/Manila"
 STATE_ENV = "AUTO_ASSIGN_STATE_PATH"
 STORE_ENV = "AUTO_ASSIGN_STORE"
+FULL_POOL_KEY = "full_pool"
 
 ASSIGNMENTS_COLLECTION_ENV = "FIRESTORE_COLLECTION_ASSIGNMENTS"
 DAILY_COLLECTION_ENV = "FIRESTORE_COLLECTION_DAILY"
@@ -50,7 +51,7 @@ class AutoAssignStore:
     ) -> Dict[str, object]:
         raise NotImplementedError
 
-    def get_daily_state(self, date_key: str) -> Dict[str, object]:
+    def get_daily_state(self, date_key: str, pool_key: str = FULL_POOL_KEY) -> Dict[str, object]:
         raise NotImplementedError
 
     def commit_assignment(
@@ -61,7 +62,8 @@ class AutoAssignStore:
         reason: str,
         date_key: str,
         next_index: Optional[int],
-        max_assignments: int,
+        max_assignments: Optional[int],
+        pool_key: str = FULL_POOL_KEY,
         now: Optional[datetime] = None,
     ) -> Dict[str, object]:
         raise NotImplementedError
@@ -85,7 +87,8 @@ class AutoAssignStore:
         date_key: str,
         next_index: Optional[int],
         max_reassign_count: int,
-        max_assignments: int,
+        max_assignments: Optional[int],
+        pool_key: str = FULL_POOL_KEY,
         now: Optional[datetime] = None,
     ) -> Dict[str, object]:
         raise NotImplementedError
@@ -150,13 +153,20 @@ class FileAutoAssignStore(AutoAssignStore):
             self._save_state(state)
         return record
 
-    def get_daily_state(self, date_key: str) -> Dict[str, object]:
+    def _pool_cursor(self, day_state: Dict[str, object], pool_key: str) -> Dict[str, object]:
+        if pool_key == FULL_POOL_KEY:
+            return day_state
+        pools = day_state.setdefault("pools", {})
+        return pools.setdefault(pool_key, {"last_index": -1})
+
+    def get_daily_state(self, date_key: str, pool_key: str = FULL_POOL_KEY) -> Dict[str, object]:
         with self._lock:
             state = self._load_state()
             daily = state.setdefault("daily", {})
             day_state = daily.setdefault(date_key, {"last_index": -1, "counts": {}})
+            cursor = self._pool_cursor(day_state, pool_key)
             return {
-                "last_index": int(day_state.get("last_index", -1)),
+                "last_index": int(cursor.get("last_index", -1)),
                 "counts": dict(day_state.get("counts") or {}),
             }
 
@@ -168,7 +178,8 @@ class FileAutoAssignStore(AutoAssignStore):
         reason: str,
         date_key: str,
         next_index: Optional[int],
-        max_assignments: int,
+        max_assignments: Optional[int],
+        pool_key: str = FULL_POOL_KEY,
         now: Optional[datetime] = None,
     ) -> Dict[str, object]:
         current = now or datetime.now(ZoneInfo(TIMEZONE))
@@ -187,19 +198,21 @@ class FileAutoAssignStore(AutoAssignStore):
             daily = state.setdefault("daily", {})
             day_state = daily.setdefault(date_key, {"last_index": -1, "counts": {}})
             counts = day_state.setdefault("counts", {})
-            current_count = int(counts.get(agent_id, 0))
-            if current_count >= max_assignments:
-                return {
-                    "status": "no_eligible_agents",
-                    "conv_code": conv_code,
-                    "agent_id": None,
-                    "reason": "quota_reached",
-                }
+            if max_assignments is not None:
+                current_count = int(counts.get(agent_id, 0))
+                if current_count >= max_assignments:
+                    return {
+                        "status": "no_eligible_agents",
+                        "conv_code": conv_code,
+                        "agent_id": None,
+                        "reason": "quota_reached",
+                    }
+                counts[agent_id] = current_count + 1
 
-            counts[agent_id] = current_count + 1
             if next_index is not None:
-                day_state["last_index"] = next_index
-                day_state["last_agent_id"] = agent_id
+                cursor = self._pool_cursor(day_state, pool_key)
+                cursor["last_index"] = next_index
+                cursor["last_agent_id"] = agent_id
 
             record = {
                 "status": "assigned",
@@ -262,7 +275,8 @@ class FileAutoAssignStore(AutoAssignStore):
         date_key: str,
         next_index: Optional[int],
         max_reassign_count: int,
-        max_assignments: int,
+        max_assignments: Optional[int],
+        pool_key: str = FULL_POOL_KEY,
         now: Optional[datetime] = None,
     ) -> Dict[str, object]:
         current = now or datetime.now(ZoneInfo(TIMEZONE))
@@ -281,19 +295,21 @@ class FileAutoAssignStore(AutoAssignStore):
             daily = state.setdefault("daily", {})
             day_state = daily.setdefault(date_key, {"last_index": -1, "counts": {}})
             counts = day_state.setdefault("counts", {})
-            current_count = int(counts.get(new_agent_id, 0))
-            if current_count >= max_assignments:
-                return {
-                    "status": "no_eligible_agents",
-                    "conv_code": conv_code,
-                    "agent_id": None,
-                    "reason": "quota_reached",
-                }
+            if max_assignments is not None:
+                current_count = int(counts.get(new_agent_id, 0))
+                if current_count >= max_assignments:
+                    return {
+                        "status": "no_eligible_agents",
+                        "conv_code": conv_code,
+                        "agent_id": None,
+                        "reason": "quota_reached",
+                    }
+                counts[new_agent_id] = current_count + 1
 
-            counts[new_agent_id] = current_count + 1
             if next_index is not None:
-                day_state["last_index"] = next_index
-                day_state["last_agent_id"] = new_agent_id
+                cursor = self._pool_cursor(day_state, pool_key)
+                cursor["last_index"] = next_index
+                cursor["last_agent_id"] = new_agent_id
 
             reassign_count = int(existing.get("reassign_count", 0) or 0) + 1
             if reassign_count > max_reassign_count:
@@ -394,13 +410,18 @@ class FirestoreAutoAssignStore(AutoAssignStore):
         self._assignment_ref(conv_code).set(record)
         return record
 
-    def get_daily_state(self, date_key: str) -> Dict[str, object]:
+    def get_daily_state(self, date_key: str, pool_key: str = FULL_POOL_KEY) -> Dict[str, object]:
         snap = self._daily_ref(date_key).get()
         if not snap.exists:
             return {"last_index": -1, "counts": {}}
         state = snap.to_dict() or {}
+        if pool_key == FULL_POOL_KEY:
+            last_index = int(state.get("last_index", -1))
+        else:
+            pool_state = (state.get("pools") or {}).get(pool_key) or {}
+            last_index = int(pool_state.get("last_index", -1))
         return {
-            "last_index": int(state.get("last_index", -1)),
+            "last_index": last_index,
             "counts": dict(state.get("counts") or {}),
         }
 
@@ -412,7 +433,8 @@ class FirestoreAutoAssignStore(AutoAssignStore):
         reason: str,
         date_key: str,
         next_index: Optional[int],
-        max_assignments: int,
+        max_assignments: Optional[int],
+        pool_key: str = FULL_POOL_KEY,
         now: Optional[datetime] = None,
     ) -> Dict[str, object]:
         current = now or datetime.now(ZoneInfo(TIMEZONE))
@@ -437,23 +459,29 @@ class FirestoreAutoAssignStore(AutoAssignStore):
             day_snap = daily_ref.get(transaction=txn)
             day_state = day_snap.to_dict() if day_snap.exists else {}
             counts = dict(day_state.get("counts") or {})
-            current_count = int(counts.get(agent_id, 0))
-            if current_count >= max_assignments:
-                return {
-                    "status": "no_eligible_agents",
-                    "conv_code": conv_code,
-                    "agent_id": None,
-                    "reason": "quota_reached",
-                }
+            if max_assignments is not None:
+                current_count = int(counts.get(agent_id, 0))
+                if current_count >= max_assignments:
+                    return {
+                        "status": "no_eligible_agents",
+                        "conv_code": conv_code,
+                        "agent_id": None,
+                        "reason": "quota_reached",
+                    }
 
             updates = {
                 "date": date_key,
                 "updated_at": current.isoformat(),
-                f"counts.{agent_id}": firestore.Increment(1),
             }
+            if max_assignments is not None:
+                updates[f"counts.{agent_id}"] = firestore.Increment(1)
             if next_index is not None:
-                updates["last_index"] = int(next_index)
-                updates["last_agent_id"] = agent_id
+                if pool_key == FULL_POOL_KEY:
+                    updates["last_index"] = int(next_index)
+                    updates["last_agent_id"] = agent_id
+                else:
+                    updates[f"pools.{pool_key}.last_index"] = int(next_index)
+                    updates[f"pools.{pool_key}.last_agent_id"] = agent_id
 
             txn.set(daily_ref, updates, merge=True)
 
@@ -514,7 +542,8 @@ class FirestoreAutoAssignStore(AutoAssignStore):
         date_key: str,
         next_index: Optional[int],
         max_reassign_count: int,
-        max_assignments: int,
+        max_assignments: Optional[int],
+        pool_key: str = FULL_POOL_KEY,
         now: Optional[datetime] = None,
     ) -> Dict[str, object]:
         current = now or datetime.now(ZoneInfo(TIMEZONE))
@@ -547,23 +576,29 @@ class FirestoreAutoAssignStore(AutoAssignStore):
             day_snap = daily_ref.get(transaction=txn)
             day_state = day_snap.to_dict() if day_snap.exists else {}
             counts = dict(day_state.get("counts") or {})
-            current_count = int(counts.get(new_agent_id, 0))
-            if current_count >= max_assignments:
-                return {
-                    "status": "no_eligible_agents",
-                    "conv_code": conv_code,
-                    "agent_id": None,
-                    "reason": "quota_reached",
-                }
+            if max_assignments is not None:
+                current_count = int(counts.get(new_agent_id, 0))
+                if current_count >= max_assignments:
+                    return {
+                        "status": "no_eligible_agents",
+                        "conv_code": conv_code,
+                        "agent_id": None,
+                        "reason": "quota_reached",
+                    }
 
             updates = {
                 "date": date_key,
                 "updated_at": current.isoformat(),
-                f"counts.{new_agent_id}": firestore.Increment(1),
             }
+            if max_assignments is not None:
+                updates[f"counts.{new_agent_id}"] = firestore.Increment(1)
             if next_index is not None:
-                updates["last_index"] = int(next_index)
-                updates["last_agent_id"] = new_agent_id
+                if pool_key == FULL_POOL_KEY:
+                    updates["last_index"] = int(next_index)
+                    updates["last_agent_id"] = new_agent_id
+                else:
+                    updates[f"pools.{pool_key}.last_index"] = int(next_index)
+                    updates[f"pools.{pool_key}.last_agent_id"] = new_agent_id
 
             txn.set(daily_ref, updates, merge=True)
 

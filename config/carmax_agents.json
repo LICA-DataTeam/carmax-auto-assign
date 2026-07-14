@@ -22,7 +22,10 @@
         {
             "team": "C",
             "agents": [
-                {"agent_key": "1z2hm98p", "agent_name": "Kent Viado", "target": 30, "min": 30, "max": 30, "active": "true"}
+                {"agent_key": "1z2hm98p", "agent_name": "Kent Viado", "target": 30, "min": 30, "max": 30, "active": "true"},
+                {"agent_key": "02zmb2py", "agent_name": "Luigi Elumba", "target": 30, "min": 30, "max": 30, "active": "true"},
+                {"agent_key": "5xueee4s", "agent_name": "Luke Hernaez", "target": 30, "min": 30, "max": 30, "active": "true"},
+                {"agent_key": "usrs69tc", "agent_name": "Nolly Quintanilla", "target": 30, "min": 30, "max": 30, "active": "true"}
             ]
         }
     ]

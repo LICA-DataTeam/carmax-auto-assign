@@ -18,6 +18,7 @@ class LiveAgentTicket(BaseModel):
     agent_id: Optional[str] = Field(default=None, alias="agentid")
     status: Optional[str] = None
     department_id: Optional[str] = Field(default=None, alias="departmentid")
+    owner_name: Optional[str] = None
     tags: Optional[List[str]] = None
     custom_fields: Optional[List[LiveAgentCustomField]] = Field(default=None, alias="custom_fields")
 

@@ -65,6 +65,7 @@ async def assign(
         incoming_agent_id=ticket.agent_id,
     )
 
+    department_id: Optional[str] = None
     existing = auto_assign.get_existing_assignment(ticket.conv_code)
     if existing:
         result = {
@@ -85,6 +86,7 @@ async def assign(
         client = LiveAgentClient()
         try:
             remote_ticket = await client.get_ticket(ticket.conv_code)
+            department_id = remote_ticket.department_id
             remote_agent = remote_ticket.agent_id or ticket.agent_id
             if remote_agent:
                 auto_assign.record_existing_assignment(
@@ -107,7 +109,10 @@ async def assign(
                     reason="ticket_already_assigned",
                 )
             else:
-                plan = auto_assign.plan_next_assignment()
+                plan = auto_assign.plan_next_assignment(
+                    department_id=department_id,
+                    owner_name=remote_ticket.owner_name,
+                )
                 if plan.get("status") != "candidate":
                     result = {
                         "status": plan.get("status"),
@@ -122,6 +127,7 @@ async def assign(
                         status=plan.get("status"),
                         agent_id=plan.get("agent_id"),
                         reason=plan.get("reason"),
+                        department_id=department_id,
                     )
                 else:
                     assign_status = os.getenv("LIVEAGENT_ASSIGN_STATUS", "N").strip()
@@ -136,6 +142,7 @@ async def assign(
                         status="candidate",
                         agent_id=plan.get("agent_id"),
                         reason=plan.get("reason"),
+                        department_id=department_id,
                     )
                     await client.assign_ticket(ticket.conv_code, payload)
                     result = auto_assign.commit_assignment(
@@ -144,6 +151,8 @@ async def assign(
                         reason=str(plan.get("reason") or "round_robin"),
                         day_key=str(plan.get("day_key")),
                         next_index=plan.get("next_index"),
+                        pool_key=str(plan.get("pool_key") or auto_assign.FULL_POOL_KEY),
+                        bypass_quota=bool(plan.get("bypass_quota", False)),
                     )
         except Exception as exc:
             log_event(
@@ -173,6 +182,7 @@ async def assign(
         agent_id=result.get("agent_id"),
         reason=result.get("reason"),
         latency_ms=latency_ms,
+        department_id=department_id,
     )
     log_event(
         logger,
@@ -181,6 +191,7 @@ async def assign(
         status=str(result.get("status")),
         agent_id=result.get("agent_id"),
         reason=result.get("reason"),
+        department_id=department_id,
     )
     return AutoAssignResponse(
         status=str(result.get("status")),

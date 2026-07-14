@@ -304,6 +304,49 @@ def admin_ui(actor: str = Depends(_admin_actor)) -> str:
     <button onclick='deleteAgent()'>Delete</button>
   </div>
 
+  <div class='row'>
+    <h3>Department Routing</h3>
+    <button onclick='loadDepartments()'>Load Departments</button>
+  </div>
+
+  <div class='row'>
+    <h3>Preview Department Routing (read-only, no ticket touched)</h3>
+    <input id='previewDeptId' placeholder='Department id' />
+    <input id='previewNow' placeholder='Simulate time (ISO8601, optional)' />
+    <input id='previewExclude' placeholder='Exclude agent_keys (comma-separated, optional)' />
+    <input id='previewOwnerName' placeholder='Simulate ticket owner_name (optional, tests owner_overrides)' />
+    <button onclick='previewDepartment()'>Preview</button>
+  </div>
+
+  <div class='row'>
+    <h3>Upsert Department Route</h3>
+    <input id='deptId' placeholder='Department id (LiveAgent departmentid)' />
+    <input id='deptLabel' placeholder='Label' />
+    <select id='deptMode'>
+      <option value='direct'>direct</option>
+      <option value='team_pool'>team_pool</option>
+      <option value='full_pool'>full_pool</option>
+    </select>
+    <input id='deptAgentKeys' placeholder='agent_keys (comma-separated)' />
+    <label><input id='deptActive' type='checkbox' checked style='width:auto;display:inline-block' /> active</label>
+    <textarea id='deptOwnerOverrides' rows='3' placeholder='team_pool only: owner_overrides as JSON, e.g. {"Carmax Authorized Agent - Kent Viado": "rljq27v2"}'></textarea>
+    <input id='deptVersion' type='number' placeholder='Expected version' />
+    <input id='deptReason' placeholder='Change reason' />
+    <button onclick='upsertDepartment()'>Save</button>
+  </div>
+
+  <div class='row'>
+    <h3>Delete Department Route</h3>
+    <input id='deptDeleteId' placeholder='Department id' />
+    <input id='deptDeleteVersion' type='number' placeholder='Expected version' />
+    <input id='deptDeleteReason' placeholder='Change reason' />
+    <select id='deptDeleteMode'>
+      <option value='deactivate'>deactivate</option>
+      <option value='remove'>remove</option>
+    </select>
+    <button onclick='deleteDepartment()'>Delete</button>
+  </div>
+
   <pre id='output'></pre>
   <script>
     function authHeader() {
@@ -361,6 +404,55 @@ def admin_ui(actor: str = Depends(_admin_actor)) -> str:
           expected_version: Number(document.getElementById('deleteVersion').value),
           change_reason: document.getElementById('deleteReason').value,
           mode: document.getElementById('deleteMode').value
+        }));
+      } catch (e) { write(e); }
+    }
+    async function loadDepartments() {
+      try { write(await api('/admin/departments')); } catch (e) { write(e); }
+    }
+    async function previewDepartment() {
+      const id = document.getElementById('previewDeptId').value;
+      const params = new URLSearchParams();
+      const now = document.getElementById('previewNow').value.trim();
+      const exclude = document.getElementById('previewExclude').value.trim();
+      const ownerName = document.getElementById('previewOwnerName').value.trim();
+      if (now) params.set('now', now);
+      if (exclude) params.set('exclude_agent_ids', exclude);
+      if (ownerName) params.set('owner_name', ownerName);
+      const qs = params.toString();
+      try {
+        write(await api('/admin/departments/' + encodeURIComponent(id) + '/preview' + (qs ? '?' + qs : '')));
+      } catch (e) { write(e); }
+    }
+    async function upsertDepartment() {
+      const id = document.getElementById('deptId').value;
+      const agentKeys = document.getElementById('deptAgentKeys').value
+        .split(',').map(s => s.trim()).filter(Boolean);
+      const overridesRaw = document.getElementById('deptOwnerOverrides').value.trim();
+      let ownerOverrides = {};
+      if (overridesRaw) {
+        try { ownerOverrides = JSON.parse(overridesRaw); }
+        catch (e) { write({error: 'owner_overrides must be valid JSON: ' + e}); return; }
+      }
+      try {
+        write(await api('/admin/departments/' + encodeURIComponent(id), 'POST', {
+          label: document.getElementById('deptLabel').value,
+          mode: document.getElementById('deptMode').value,
+          agent_keys: agentKeys,
+          active: document.getElementById('deptActive').checked,
+          owner_overrides: ownerOverrides,
+          expected_version: Number(document.getElementById('deptVersion').value),
+          change_reason: document.getElementById('deptReason').value
+        }));
+      } catch (e) { write(e); }
+    }
+    async function deleteDepartment() {
+      const id = document.getElementById('deptDeleteId').value;
+      try {
+        write(await api('/admin/departments/' + encodeURIComponent(id), 'DELETE', {
+          expected_version: Number(document.getElementById('deptDeleteVersion').value),
+          change_reason: document.getElementById('deptDeleteReason').value,
+          mode: document.getElementById('deptDeleteMode').value
         }));
       } catch (e) { write(e); }
     }

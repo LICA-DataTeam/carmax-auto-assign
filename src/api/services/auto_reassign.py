@@ -123,9 +123,13 @@ async def run_auto_reassign(
                 continue
 
             current_agent = getattr(ticket, "agent_id", None) or record.get("agent_id")
+            department_id = getattr(ticket, "department_id", None)
+            owner_name = getattr(ticket, "owner_name", None)
             plan = auto_assign.plan_next_assignment(
                 now=now,
                 exclude_agent_ids={str(current_agent)} if current_agent else None,
+                department_id=department_id,
+                owner_name=owner_name,
             )
             if plan.get("status") != "candidate":
                 log_bq_event(
@@ -134,6 +138,7 @@ async def run_auto_reassign(
                     conv_code=conv_code,
                     status=plan.get("status"),
                     reason=plan.get("reason"),
+                    department_id=department_id,
                 )
                 results.append(
                     {
@@ -155,6 +160,7 @@ async def run_auto_reassign(
                 status="candidate",
                 agent_id=plan.get("agent_id"),
                 reason=plan.get("reason"),
+                department_id=department_id,
             )
 
             try:
@@ -177,6 +183,7 @@ async def run_auto_reassign(
                 )
                 continue
 
+            bypass_quota = bool(plan.get("bypass_quota", False))
             commit = store.commit_reassign(
                 conv_code=conv_code,
                 new_agent_id=str(plan.get("agent_id")),
@@ -185,7 +192,8 @@ async def run_auto_reassign(
                 date_key=str(plan.get("day_key")),
                 next_index=plan.get("next_index"),
                 max_reassign_count=REASSIGN_MAX_ATTEMPTS,
-                max_assignments=auto_assign.MAX_ASSIGNMENTS_PER_AGENT,
+                max_assignments=None if bypass_quota else auto_assign.MAX_ASSIGNMENTS_PER_AGENT,
+                pool_key=str(plan.get("pool_key") or "full_pool"),
                 now=now,
             )
             log_bq_event(
@@ -195,6 +203,7 @@ async def run_auto_reassign(
                 agent_id=commit.get("agent_id"),
                 reason=commit.get("reason"),
                 previous_agent_id=current_agent,
+                department_id=department_id,
             )
             results.append(commit)
     finally:
