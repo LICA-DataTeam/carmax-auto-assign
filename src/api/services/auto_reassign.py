@@ -12,7 +12,7 @@ from src.api.services import auto_assign
 from src.api.services.auto_assign_store import get_store
 from src.api.services.bq_logger import log_bq_event
 from src.api.utils.logging import get_logger, log_event
-from src.integrations.liveagent import LiveAgentClient
+from src.integrations.liveagent import LiveAgentClient, extract_private_message_page_name
 
 
 logger = get_logger(__name__)
@@ -38,6 +38,25 @@ def _eligible_statuses() -> List[str]:
 
 def _now() -> datetime:
     return datetime.now(ZoneInfo(TIMEZONE))
+
+
+async def _resolve_owner_override_fallback_name(
+    client: LiveAgentClient, conv_code: str
+) -> Optional[str]:
+    """See src.api.routes.assign._resolve_owner_override_fallback_name - same
+    fallback, used here so stale team_pool tickets re-checked by auto-reassign
+    get the same owner_overrides treatment as the initial assign."""
+    try:
+        messages_payload = await client.get_ticket_messages(conv_code)
+    except Exception as exc:
+        log_event(
+            logger,
+            "auto_reassign_owner_override_fallback_fetch_failed",
+            conv_code=conv_code,
+            error=str(exc),
+        )
+        return None
+    return extract_private_message_page_name(messages_payload)
 
 
 async def run_auto_reassign(
@@ -131,6 +150,22 @@ async def run_auto_reassign(
                 department_id=department_id,
                 owner_name=owner_name,
             )
+            if (
+                plan.get("status") == "candidate"
+                and plan.get("reason") == "team_pool"
+                and plan.get("owner_overrides_configured")
+            ):
+                fallback_owner_name = await _resolve_owner_override_fallback_name(client, conv_code)
+                if fallback_owner_name:
+                    fallback_plan = auto_assign.plan_next_assignment(
+                        now=now,
+                        exclude_agent_ids={str(current_agent)} if current_agent else None,
+                        department_id=department_id,
+                        owner_name=fallback_owner_name,
+                        owner_name_source="ticket_message_fallback",
+                    )
+                    if fallback_plan.get("reason") == "team_pool_owner_override_message_fallback":
+                        plan = fallback_plan
             if plan.get("status") != "candidate":
                 log_bq_event(
                     "auto_reassign_decision",

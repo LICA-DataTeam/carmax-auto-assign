@@ -10,10 +10,32 @@ from src.api.models import AssignTicketRequest
 from src.api.services.bq_logger import log_bq_event
 from src.api.services import auto_assign, run_auto_reassign
 from src.api.utils.logging import get_logger, log_event
-from src.integrations.liveagent import LiveAgentClient
+from src.integrations.liveagent import LiveAgentClient, extract_private_message_page_name
 
 router = APIRouter()
 logger = get_logger(__name__)
+
+
+async def _resolve_owner_override_fallback_name(
+    client: LiveAgentClient, conv_code: str
+) -> Optional[str]:
+    """When a team_pool department's owner_overrides map misses on the
+    ticket's own owner_name (e.g. a private FB message where owner_name
+    carries the customer's name, not the page name), fetch the ticket's
+    messages and look for LiveAgent's "Private message to: <a>PAGE</a>"
+    system message as a fallback signal of which page it landed on."""
+    try:
+        messages_payload = await client.get_ticket_messages(conv_code)
+    except Exception as exc:
+        log_event(
+            logger,
+            "auto_assign_owner_override_fallback_fetch_failed",
+            conv_code=conv_code,
+            error=str(exc),
+        )
+        return None
+    return extract_private_message_page_name(messages_payload)
+
 
 class LiveAgentTicketWebHook(BaseModel):
     conv_code: str
@@ -113,6 +135,22 @@ async def assign(
                     department_id=department_id,
                     owner_name=remote_ticket.owner_name,
                 )
+                if (
+                    plan.get("status") == "candidate"
+                    and plan.get("reason") == "team_pool"
+                    and plan.get("owner_overrides_configured")
+                ):
+                    fallback_owner_name = await _resolve_owner_override_fallback_name(
+                        client, ticket.conv_code
+                    )
+                    if fallback_owner_name:
+                        fallback_plan = auto_assign.plan_next_assignment(
+                            department_id=department_id,
+                            owner_name=fallback_owner_name,
+                            owner_name_source="ticket_message_fallback",
+                        )
+                        if fallback_plan.get("reason") == "team_pool_owner_override_message_fallback":
+                            plan = fallback_plan
                 if plan.get("status") != "candidate":
                     result = {
                         "status": plan.get("status"),

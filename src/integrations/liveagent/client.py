@@ -27,6 +27,11 @@ class LiveAgentClient:
         resp.raise_for_status()
         return LiveAgentTicket.model_validate(resp.json())
 
+    async def get_ticket_messages(self, ticket_id: str) -> object:
+        resp = await self._client.get(f"/tickets/{ticket_id}/messages", headers=self._headers())
+        resp.raise_for_status()
+        return resp.json()
+
     async def assign_ticket(self, ticket_id: str, payload: AssignTicketRequest) -> LiveAgentTicket:
         resp = await self._client.put(
             f"/tickets/{ticket_id}",
