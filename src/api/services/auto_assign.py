@@ -399,6 +399,7 @@ def plan_next_assignment(
     exclude_agent_ids: Optional[set[str]] = None,
     department_id: Optional[str] = None,
     owner_name: Optional[str] = None,
+    owner_name_source: str = "ticket_owner_name",
 ) -> Dict[str, object]:
     current = now.astimezone(ZoneInfo(TIMEZONE)) if now else datetime.now(ZoneInfo(TIMEZONE))
     if not is_within_window(current):
@@ -471,16 +472,23 @@ def plan_next_assignment(
                 if override_agent_id:
                     override_agent = agents_by_id.get(override_agent_id)
                     if override_agent and override_agent.agent_id not in exclude_agent_ids:
+                        is_fallback = owner_name_source != "ticket_owner_name"
+                        reason = (
+                            "team_pool_owner_override_message_fallback"
+                            if is_fallback
+                            else "team_pool_owner_override"
+                        )
                         log_event(
                             logger,
                             "auto_assign_team_pool_owner_override",
                             department_id=department_id,
                             agent_id=override_agent.agent_id,
+                            owner_name_source=owner_name_source,
                         )
                         return {
                             "status": "candidate",
                             "agent_id": override_agent.agent_id,
-                            "reason": "team_pool_owner_override",
+                            "reason": reason,
                             "day_key": day_key,
                             "next_index": None,
                             "pool_key": f"owner_override:{department_id}",
@@ -510,6 +518,7 @@ def plan_next_assignment(
                 "next_index": next_index,
                 "pool_key": pool_key,
                 "bypass_quota": False,
+                "owner_overrides_configured": bool(route.owner_overrides),
             }
 
         # route.mode == ROUTING_MODE_FULL_POOL falls through to the shared pool below.

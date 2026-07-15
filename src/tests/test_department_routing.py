@@ -378,6 +378,80 @@ def test_team_pool_owner_override_falls_back_when_target_excluded(
     assert result["agent_id"] == "a1"
 
 
+def test_team_pool_round_robin_reports_owner_overrides_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _setup_env(
+        tmp_path,
+        ["a1", "b2"],
+        {
+            "p1ivd5m8": {
+                "label": "CMC - FB Page",
+                "mode": "team_pool",
+                "agent_keys": ["a1", "b2"],
+                "active": True,
+                "owner_overrides": {"page-a1": "a1"},
+            }
+        },
+        monkeypatch,
+    )
+    result = auto_assign.plan_next_assignment(
+        now=_now_in_window(), department_id="p1ivd5m8", owner_name="unmatched customer name"
+    )
+    assert result["reason"] == "team_pool"
+    assert result["owner_overrides_configured"] is True
+
+
+def test_team_pool_round_robin_reports_no_owner_overrides_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _setup_env(
+        tmp_path,
+        ["a1", "b2"],
+        {
+            "p1ivd5m8": {
+                "label": "Team 1",
+                "mode": "team_pool",
+                "agent_keys": ["a1", "b2"],
+                "active": True,
+            }
+        },
+        monkeypatch,
+    )
+    result = auto_assign.plan_next_assignment(now=_now_in_window(), department_id="p1ivd5m8")
+    assert result["reason"] == "team_pool"
+    assert result["owner_overrides_configured"] is False
+
+
+def test_team_pool_owner_override_message_fallback_source_tags_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _setup_env(
+        tmp_path,
+        ["a1", "b2"],
+        {
+            "p1ivd5m8": {
+                "label": "CMC - FB Page",
+                "mode": "team_pool",
+                "agent_keys": ["a1", "b2"],
+                "active": True,
+                "owner_overrides": {"carmax authorized agent - b two": "b2"},
+            }
+        },
+        monkeypatch,
+    )
+    result = auto_assign.plan_next_assignment(
+        now=_now_in_window(),
+        department_id="p1ivd5m8",
+        owner_name="Carmax Authorized Agent - B Two",
+        owner_name_source="ticket_message_fallback",
+    )
+    assert result["status"] == "candidate"
+    assert result["agent_id"] == "b2"
+    assert result["reason"] == "team_pool_owner_override_message_fallback"
+    assert result["bypass_quota"] is True
+
+
 def test_parse_department_routing_owner_override_target_must_be_in_agent_keys() -> None:
     with pytest.raises(ValueError, match="must also be listed in agent_keys"):
         auto_assign._parse_department_routing_payload(
