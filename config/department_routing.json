@@ -6,12 +6,12 @@
         "p1ivd5m8": {
             "label": "CMC - FB Page",
             "mode": "team_pool",
-            "agent_keys": ["02zmb2py", "5xueee4s", "rljq27v2", "x1bgw6q2"],
+            "agent_keys": ["02zmb2py", "5xueee4s", "1z2hm98p", "rljq27v2", "x1bgw6q2"],
             "active": true,
             "owner_overrides": {
                 "Carmax Authorized Agent - Luigi Elumba": "02zmb2py",
                 "Carmax Authorized Agent - Luke B Hernaez": "5xueee4s",
-                "Carmax Authorized Agent - Kent Viado": "rljq27v2",
+                "Carmax Authorized Agent - Kent Viado": "1z2hm98p",
                 "Carmax Authorized Agent - Mark john Castro": "x1bgw6q2"
             }
         },
@@ -29,10 +29,10 @@
         "q1h4yk8b": {
             "label": "CMC - Raf and Monique",
             "mode": "team_pool",
-            "agent_keys": ["1z2hm98p", "iq74g6mz"],
+            "agent_keys": ["57qw5x5n", "iq74g6mz"],
             "active": true,
             "owner_overrides": {
-                "Carmax carmona - john rafael malubag": "1z2hm98p",
+                "Carmax carmona - john rafael malubag": "57qw5x5n",
                 "Carmax carmona - monique aguinaldo": "iq74g6mz"
             }
         }
