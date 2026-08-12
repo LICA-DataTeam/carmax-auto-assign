@@ -244,8 +244,7 @@ def remove_agent(
 
 
 @router.get("/ui", response_class=HTMLResponse)
-def admin_ui(actor: str = Depends(_admin_actor)) -> str:
-    _ = actor
+def admin_ui() -> str:
     return """<!DOCTYPE html>
 <html>
 <head>
