@@ -331,6 +331,129 @@ async def test_liveagent_failure_does_not_commit(monkeypatch: pytest.MonkeyPatch
     assert result.reason == "liveagent_error"
 
 
+class _Agent:
+    def __init__(self, id, status, online_status):
+        self.id = id
+        self.status = status
+        self.online_status = online_status
+
+
+@pytest.mark.anyio
+async def test_offline_employed_agent_excluded_from_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("AUTO_ASSIGN_STORE", "file")
+    reset_store_cache()
+    monkeypatch.setattr(auto_assign, "get_existing_assignment", lambda conv_code: None)
+
+    captured = {}
+
+    def _plan_next_assignment(*, exclude_agent_ids=None, **kwargs):
+        captured["exclude_agent_ids"] = exclude_agent_ids
+        return {
+            "status": "candidate",
+            "agent_id": "online_agent",
+            "reason": "round_robin",
+            "day_key": "2026-03-13",
+            "next_index": 0,
+        }
+
+    monkeypatch.setattr(auto_assign, "plan_next_assignment", _plan_next_assignment)
+    monkeypatch.setattr(
+        auto_assign,
+        "commit_assignment",
+        lambda **kwargs: {
+            "status": "assigned",
+            "conv_code": kwargs["conv_code"],
+            "agent_id": kwargs["agent_id"],
+            "reason": kwargs["reason"],
+        },
+    )
+
+    class _Client:
+        async def get_ticket(self, ticket_id: str):
+            return _Ticket(agent_id=None)
+
+        async def list_agents(self):
+            return [
+                _Agent(id="offline_agent", status="A", online_status="F"),
+                _Agent(id="online_agent", status="A", online_status="N"),
+                _Agent(id="deleted_agent", status="X", online_status="F"),
+            ]
+
+        async def assign_ticket(self, ticket_id: str, payload):
+            return _Ticket(agent_id=payload.agent_id)
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(assign_route, "LiveAgentClient", _Client)
+
+    result = await assign_route.assign(
+        conv_code="c7",
+        agent_id=None,
+        x_cmx_auto_assign_secret="secret",
+    )
+    assert result.status == "assigned"
+    assert result.agent_id == "online_agent"
+    assert captured["exclude_agent_ids"] == {"offline_agent"}
+
+
+@pytest.mark.anyio
+async def test_online_status_fetch_failure_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("AUTO_ASSIGN_STORE", "file")
+    reset_store_cache()
+    monkeypatch.setattr(auto_assign, "get_existing_assignment", lambda conv_code: None)
+
+    captured = {}
+
+    def _plan_next_assignment(*, exclude_agent_ids=None, **kwargs):
+        captured["exclude_agent_ids"] = exclude_agent_ids
+        return {
+            "status": "candidate",
+            "agent_id": "a1",
+            "reason": "round_robin",
+            "day_key": "2026-03-13",
+            "next_index": 0,
+        }
+
+    monkeypatch.setattr(auto_assign, "plan_next_assignment", _plan_next_assignment)
+    monkeypatch.setattr(
+        auto_assign,
+        "commit_assignment",
+        lambda **kwargs: {
+            "status": "assigned",
+            "conv_code": kwargs["conv_code"],
+            "agent_id": kwargs["agent_id"],
+            "reason": kwargs["reason"],
+        },
+    )
+
+    class _Client:
+        async def get_ticket(self, ticket_id: str):
+            return _Ticket(agent_id=None)
+
+        async def list_agents(self):
+            raise RuntimeError("LiveAgent unavailable")
+
+        async def assign_ticket(self, ticket_id: str, payload):
+            return _Ticket(agent_id=payload.agent_id)
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(assign_route, "LiveAgentClient", _Client)
+
+    result = await assign_route.assign(
+        conv_code="c8",
+        agent_id=None,
+        x_cmx_auto_assign_secret="secret",
+    )
+    assert result.status == "assigned"
+    assert result.agent_id == "a1"
+    assert captured["exclude_agent_ids"] == set()
+
+
 @pytest.mark.anyio
 async def test_department_id_threads_into_plan_next_assignment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WEBHOOK_SECRET", "secret")

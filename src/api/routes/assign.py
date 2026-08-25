@@ -37,6 +37,29 @@ async def _resolve_owner_override_fallback_name(
     return extract_private_message_page_name(messages_payload)
 
 
+async def _fetch_offline_agent_ids(client: LiveAgentClient, conv_code: str) -> set[str]:
+    """An employed agent (status "A") who is currently offline in LiveAgent
+    (online_status "F") is excluded from candidate selection so assignment
+    falls through to the next online agent. Fails open: if the live agent
+    list can't be fetched, returns an empty set so assignment still proceeds
+    against the existing eligible pool instead of blocking on this side call."""
+    try:
+        agents = await client.list_agents()
+    except Exception as exc:
+        log_event(
+            logger,
+            "auto_assign_online_status_fetch_failed",
+            conv_code=conv_code,
+            error=str(exc),
+        )
+        return set()
+    return {
+        str(agent.id)
+        for agent in agents
+        if agent.id and agent.status == "A" and agent.online_status == "F"
+    }
+
+
 class LiveAgentTicketWebHook(BaseModel):
     conv_code: str
     agent_id: Optional[str] = None
@@ -131,9 +154,11 @@ async def assign(
                     reason="ticket_already_assigned",
                 )
             else:
+                offline_agent_ids = await _fetch_offline_agent_ids(client, ticket.conv_code)
                 plan = auto_assign.plan_next_assignment(
                     department_id=department_id,
                     owner_name=remote_ticket.owner_name,
+                    exclude_agent_ids=offline_agent_ids,
                 )
                 if (
                     plan.get("status") == "candidate"
@@ -148,6 +173,7 @@ async def assign(
                             department_id=department_id,
                             owner_name=fallback_owner_name,
                             owner_name_source="ticket_message_fallback",
+                            exclude_agent_ids=offline_agent_ids,
                         )
                         if fallback_plan.get("reason") == "team_pool_owner_override_message_fallback":
                             plan = fallback_plan

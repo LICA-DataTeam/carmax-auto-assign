@@ -59,6 +59,28 @@ async def _resolve_owner_override_fallback_name(
     return extract_private_message_page_name(messages_payload)
 
 
+async def _fetch_offline_agent_ids(client: LiveAgentClient, request_id: str) -> set[str]:
+    """See src.api.routes.assign._fetch_offline_agent_ids - same fail-open
+    fetch, used here so stale-assignment reassignment also skips an employed
+    agent (status "A") who is currently offline in LiveAgent (online_status
+    "F")."""
+    try:
+        agents = await client.list_agents()
+    except Exception as exc:
+        log_event(
+            logger,
+            "auto_reassign_online_status_fetch_failed",
+            request_id=request_id,
+            error=str(exc),
+        )
+        return set()
+    return {
+        str(agent.id)
+        for agent in agents
+        if agent.id and agent.status == "A" and agent.online_status == "F"
+    }
+
+
 async def run_auto_reassign(
     *,
     limit: Optional[int] = None,
@@ -96,6 +118,7 @@ async def run_auto_reassign(
 
     client = LiveAgentClient()
     try:
+        offline_agent_ids = await _fetch_offline_agent_ids(client, request_id)
         for record in candidates:
             conv_code = str(record.get("conv_code") or "")
             if not conv_code:
@@ -144,9 +167,12 @@ async def run_auto_reassign(
             current_agent = getattr(ticket, "agent_id", None) or record.get("agent_id")
             department_id = getattr(ticket, "department_id", None)
             owner_name = getattr(ticket, "owner_name", None)
+            exclude_agent_ids = set(offline_agent_ids)
+            if current_agent:
+                exclude_agent_ids.add(str(current_agent))
             plan = auto_assign.plan_next_assignment(
                 now=now,
-                exclude_agent_ids={str(current_agent)} if current_agent else None,
+                exclude_agent_ids=exclude_agent_ids,
                 department_id=department_id,
                 owner_name=owner_name,
             )
@@ -159,7 +185,7 @@ async def run_auto_reassign(
                 if fallback_owner_name:
                     fallback_plan = auto_assign.plan_next_assignment(
                         now=now,
-                        exclude_agent_ids={str(current_agent)} if current_agent else None,
+                        exclude_agent_ids=exclude_agent_ids,
                         department_id=department_id,
                         owner_name=fallback_owner_name,
                         owner_name_source="ticket_message_fallback",
