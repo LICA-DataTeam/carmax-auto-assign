@@ -47,9 +47,8 @@
         - `status: "already_assigned"`
 
 5. **Time Window**
-    - Runs from **08:30 to 17:30 (Asia/Manila)**.
-    - Outside time window, return:
-        - `status: "outside_hours"`
+    - Runs **24/7, Monday through Sunday** (Asia/Manila). There is no office-hour gate.
+    - The `outside_hours` / `outside_time_window` status is retained in code but is no longer reachable.
 
 6. **Load agents**
     - Stored in static JSON file (`config/`)

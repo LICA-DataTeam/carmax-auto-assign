@@ -14,10 +14,6 @@ from src.api.services.auto_assign_store import FULL_POOL_KEY, get_store
 
 MAX_ASSIGNMENTS_PER_AGENT = 30
 TIMEZONE = "Asia/Manila"
-WINDOW_START_HOUR = 8
-WINDOW_START_MINUTE = 30
-WINDOW_END_HOUR = 17
-WINDOW_END_MINUTE = 30
 CONFIG_ENV = "AUTO_ASSIGN_CONFIG_PATH"
 logger = get_logger(__name__)
 
@@ -330,16 +326,9 @@ def load_department_routing() -> Dict[str, DepartmentRoute]:
 
 
 def is_within_window(now: Optional[datetime] = None) -> bool:
-    tz = ZoneInfo(TIMEZONE)
-    current = now.astimezone(tz) if now else datetime.now(tz)
-    if current.hour < WINDOW_START_HOUR:
-        return False
-    if current.hour == WINDOW_START_HOUR and current.minute < WINDOW_START_MINUTE:
-        return False
-    if current.hour > WINDOW_END_HOUR:
-        return False
-    if current.hour == WINDOW_END_HOUR and current.minute > WINDOW_END_MINUTE:
-        return False
+    """Auto-assign runs 24/7, Monday through Sunday. The time-of-day
+    office-hour window was removed, so this always returns True. Kept as
+    the single re-enable point if office-hour gating is reintroduced."""
     return True
 
 

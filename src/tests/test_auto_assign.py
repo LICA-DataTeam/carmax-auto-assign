@@ -91,16 +91,24 @@ def test_quota_cutoff(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     assert result["reason"] == "quota_reached"
 
 
-def test_outside_window(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_assigns_early_morning(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _setup_env(tmp_path, ["a1"], monkeypatch)
     result = auto_assign.assign_round_robin(conv_code="c1", incoming_agent_id=None, now=_now_outside_window())
-    assert result["status"] == "outside_hours"
+    assert result["status"] == "assigned"
 
 
-def test_outside_window_after_end(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_assigns_late_evening(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _setup_env(tmp_path, ["a1"], monkeypatch)
     result = auto_assign.assign_round_robin(conv_code="c1", incoming_agent_id=None, now=_now_after_window())
-    assert result["status"] == "outside_hours"
+    assert result["status"] == "assigned"
+
+
+def test_assigns_on_weekend_overnight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _setup_env(tmp_path, ["a1"], monkeypatch)
+    # Sunday, 03:00 Asia/Manila - outside any prior office-hour window and on a weekend.
+    sunday_overnight = datetime(2026, 3, 15, 3, 0, tzinfo=ZoneInfo("Asia/Manila"))
+    result = auto_assign.assign_round_robin(conv_code="c1", incoming_agent_id=None, now=sunday_overnight)
+    assert result["status"] == "assigned"
 
 
 def test_load_agents_duplicate_agent_key_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
