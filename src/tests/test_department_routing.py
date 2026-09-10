@@ -86,7 +86,7 @@ def test_direct_mode_bypasses_quota(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         assert result["agent_id"] == "angelo"
 
 
-def test_direct_mode_respects_office_hours(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_direct_mode_assigns_outside_prior_office_hours(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _setup_env(
         tmp_path,
         ["angelo"],
@@ -99,7 +99,8 @@ def test_direct_mode_respects_office_hours(monkeypatch: pytest.MonkeyPatch, tmp_
         now=_now_outside_window(),
         department_id="mqemg9w7",
     )
-    assert result["status"] == "outside_hours"
+    assert result["status"] == "assigned"
+    assert result["agent_id"] == "angelo"
 
 
 def test_direct_mode_fails_safe_when_agent_inactive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
