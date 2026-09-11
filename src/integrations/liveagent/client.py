@@ -42,14 +42,32 @@ class LiveAgentClient:
         return LiveAgentTicket.model_validate(resp.json())
 
     async def list_agents(self) -> List[LiveAgentAgent]:
-        resp = await self._client.get("/agents", headers=self._headers())
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, list):
-            return [LiveAgentAgent.model_validate(item) for item in data]
-        if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
-            return [LiveAgentAgent.model_validate(item) for item in data["data"]]
-        return []
+        """LiveAgent silently paginates GET /agents (confirmed live: a bare
+        call returns only the first 10 of 38 agents) so this walks pages
+        until a short/empty page signals the end, instead of trusting a
+        single call to return the full roster."""
+        agents: List[LiveAgentAgent] = []
+        page = 1
+        per_page = 100
+        while page <= self.settings.max_agent_pages:
+            resp = await self._client.get(
+                "/agents",
+                headers=self._headers(),
+                params={"_page": page, "_perPage": per_page},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+                items = data["data"]
+            else:
+                items = []
+            agents.extend(LiveAgentAgent.model_validate(item) for item in items)
+            if len(items) < per_page:
+                break
+            page += 1
+        return agents
 
     async def close(self) -> None:
         await self._client.aclose()

@@ -14,6 +14,7 @@ class LiveAgentSettings:
     api_header: str
     timeout_seconds: float
     verify_ssl: bool
+    max_agent_pages: int
 
 
 def _bool_env(value: str | None, default: bool) -> bool:
@@ -28,6 +29,7 @@ def load_liveagent_settings() -> LiveAgentSettings:
     api_header = os.getenv("LIVEAGENT_API_HEADER", "apikey").strip()
     timeout_seconds = float(os.getenv("LIVEAGENT_TIMEOUT_SECONDS", "10").strip())
     verify_ssl = _bool_env(os.getenv("LIVEAGENT_VERIFY_SSL"), True)
+    max_agent_pages = int(os.getenv("LIVEAGENT_MAX_AGENT_PAGES", "50").strip())
 
     return LiveAgentSettings(
         base_url=base_url,
@@ -35,4 +37,5 @@ def load_liveagent_settings() -> LiveAgentSettings:
         api_header=api_header,
         timeout_seconds=timeout_seconds,
         verify_ssl=verify_ssl,
+        max_agent_pages=max_agent_pages,
     )
