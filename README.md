@@ -26,6 +26,7 @@
   "max": 30
 }
 ```
+- `team` is optional — omit it (or leave it blank) and the agent is filed under `"Unassigned"`. Teams are just an organizational label in the config; they have no effect on round-robin assignment.
 
 ## Flow
 1. Accepts HTTP request from CarMax LiveAgent automated rule:

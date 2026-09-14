@@ -22,7 +22,7 @@ _bearer = HTTPBearer(auto_error=False)
 
 
 class AgentCreateRequest(BaseModel):
-    team: str = Field(..., min_length=1)
+    team: Optional[str] = Field(None, min_length=1)
     agent_key: str = Field(..., min_length=1)
     agent_name: str = Field(..., min_length=1)
     active: bool = True
@@ -268,7 +268,7 @@ def admin_ui() -> str:
 
   <div class='row'>
     <h3>Create Agent</h3>
-    <input id='createTeam' placeholder='Team' />
+    <input id='createTeam' placeholder='Team (optional, defaults to Unassigned)' />
     <input id='createKey' placeholder='Agent key' />
     <input id='createName' placeholder='Agent name' />
     <input id='createTarget' type='number' placeholder='Target' />
@@ -371,7 +371,7 @@ def admin_ui() -> str:
     async function createAgent() {
       try {
         write(await api('/admin/agents', 'POST', {
-          team: document.getElementById('createTeam').value,
+          team: document.getElementById('createTeam').value.trim() || null,
           agent_key: document.getElementById('createKey').value,
           agent_name: document.getElementById('createName').value,
           active: true,

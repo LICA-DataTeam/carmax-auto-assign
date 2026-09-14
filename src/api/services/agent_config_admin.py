@@ -18,6 +18,8 @@ FIRESTORE_DATABASE_ENV = "FIRESTORE_DATABASE_ID"
 FIRESTORE_CREDENTIALS_ENV = "CREDENTIALS"
 AUDIT_COLLECTION_ENV = "FIRESTORE_COLLECTION_AGENT_CONFIG_AUDIT"
 
+UNASSIGNED_TEAM = "Unassigned"
+
 
 class AdminConfigError(Exception):
     pass
@@ -203,7 +205,7 @@ def get_agent_config() -> Dict[str, object]:
 
 def create_agent(
     *,
-    team: str,
+    team: Optional[str] = None,
     agent_key: str,
     agent_name: str,
     active: bool,
@@ -214,11 +216,9 @@ def create_agent(
     min_value: int,
     max_value: int,
 ) -> AgentMutationResult:
-    team_name = team.strip()
+    team_name = (team or "").strip() or UNASSIGNED_TEAM
     normalized_key = agent_key.strip()
     normalized_name = agent_name.strip()
-    if not team_name:
-        raise ValidationError("team is required")
     if not normalized_key:
         raise ValidationError("agent_key is required")
     if not normalized_name:
