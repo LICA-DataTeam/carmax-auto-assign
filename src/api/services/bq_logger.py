@@ -94,7 +94,11 @@ class BigQueryLogger:
     def log(self, payload: Dict[str, Any]) -> None:
         if not self.enabled or not self._client or not self._table_id:
             return
-        errors = self._client.insert_rows_json(self._table_id, [payload])
+        # ignore_unknown_values: a field the table has no column for yet (e.g. a
+        # newly added overflow_from) is dropped instead of rejecting the whole row.
+        errors = self._client.insert_rows_json(
+            self._table_id, [payload], ignore_unknown_values=True
+        )
         if errors:
             logger.warning("BigQuery insert failed: %s", errors)
 

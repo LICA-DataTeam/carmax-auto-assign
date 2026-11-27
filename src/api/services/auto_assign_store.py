@@ -19,6 +19,8 @@ TIMEZONE = "Asia/Manila"
 STATE_ENV = "AUTO_ASSIGN_STATE_PATH"
 STORE_ENV = "AUTO_ASSIGN_STORE"
 FULL_POOL_KEY = "full_pool"
+# Rotation cursor for the overflow group (group B), kept apart from full_pool.
+OVERFLOW_POOL_KEY = "overflow"
 
 ASSIGNMENTS_COLLECTION_ENV = "FIRESTORE_COLLECTION_ASSIGNMENTS"
 DAILY_COLLECTION_ENV = "FIRESTORE_COLLECTION_DAILY"
@@ -65,6 +67,7 @@ class AutoAssignStore:
         max_assignments: Optional[int],
         pool_key: str = FULL_POOL_KEY,
         now: Optional[datetime] = None,
+        extra_cursors: Optional[Dict[str, int]] = None,
     ) -> Dict[str, object]:
         raise NotImplementedError
 
@@ -100,6 +103,7 @@ class AutoAssignStore:
         max_assignments: Optional[int],
         pool_key: str = FULL_POOL_KEY,
         now: Optional[datetime] = None,
+        extra_cursors: Optional[Dict[str, int]] = None,
     ) -> Dict[str, object]:
         raise NotImplementedError
 
@@ -239,6 +243,7 @@ class FileAutoAssignStore(AutoAssignStore):
         max_assignments: Optional[int],
         pool_key: str = FULL_POOL_KEY,
         now: Optional[datetime] = None,
+        extra_cursors: Optional[Dict[str, int]] = None,
     ) -> Dict[str, object]:
         current = now or datetime.now(ZoneInfo(TIMEZONE))
         with self._lock:
@@ -272,6 +277,10 @@ class FileAutoAssignStore(AutoAssignStore):
                 cursor = self._pool_cursor(day_state, pool_key)
                 cursor["last_index"] = next_index
                 cursor["last_agent_id"] = agent_id
+            for extra_key, extra_index in (extra_cursors or {}).items():
+                extra_cursor = self._pool_cursor(day_state, extra_key)
+                extra_cursor["last_index"] = int(extra_index)
+                extra_cursor["last_agent_id"] = agent_id
 
             record = {
                 "status": "assigned",
@@ -339,6 +348,7 @@ class FileAutoAssignStore(AutoAssignStore):
         max_assignments: Optional[int],
         pool_key: str = FULL_POOL_KEY,
         now: Optional[datetime] = None,
+        extra_cursors: Optional[Dict[str, int]] = None,
     ) -> Dict[str, object]:
         current = now or datetime.now(ZoneInfo(TIMEZONE))
         with self._lock:
@@ -379,6 +389,10 @@ class FileAutoAssignStore(AutoAssignStore):
                 cursor = self._pool_cursor(day_state, pool_key)
                 cursor["last_index"] = next_index
                 cursor["last_agent_id"] = new_agent_id
+            for extra_key, extra_index in (extra_cursors or {}).items():
+                extra_cursor = self._pool_cursor(day_state, extra_key)
+                extra_cursor["last_index"] = int(extra_index)
+                extra_cursor["last_agent_id"] = new_agent_id
             record = {
                 **existing,
                 "status": "assigned",
@@ -409,6 +423,7 @@ def _daily_updates(
     next_index: Optional[int],
     pool_key: str,
     now: datetime,
+    extra_cursors: Optional[Dict[str, int]] = None,
 ) -> Dict[str, object]:
     """Payload for txn.set(daily_ref, ..., merge=True).
 
@@ -431,6 +446,9 @@ def _daily_updates(
             updates["pools"] = {
                 pool_key: {"last_index": int(next_index), "last_agent_id": agent_id}
             }
+    for extra_key, extra_index in (extra_cursors or {}).items():
+        pools = updates.setdefault("pools", {})
+        pools[extra_key] = {"last_index": int(extra_index), "last_agent_id": agent_id}
     return updates
 
 
@@ -529,6 +547,7 @@ class FirestoreAutoAssignStore(AutoAssignStore):
         max_assignments: Optional[int],
         pool_key: str = FULL_POOL_KEY,
         now: Optional[datetime] = None,
+        extra_cursors: Optional[Dict[str, int]] = None,
     ) -> Dict[str, object]:
         current = now or datetime.now(ZoneInfo(TIMEZONE))
         assignment_ref = self._assignment_ref(conv_code)
@@ -571,6 +590,7 @@ class FirestoreAutoAssignStore(AutoAssignStore):
                     next_index=next_index,
                     pool_key=pool_key,
                     now=current,
+                    extra_cursors=extra_cursors,
                 ),
                 merge=True,
             )
@@ -643,6 +663,7 @@ class FirestoreAutoAssignStore(AutoAssignStore):
         max_assignments: Optional[int],
         pool_key: str = FULL_POOL_KEY,
         now: Optional[datetime] = None,
+        extra_cursors: Optional[Dict[str, int]] = None,
     ) -> Dict[str, object]:
         current = now or datetime.now(ZoneInfo(TIMEZONE))
         assignment_ref = self._assignment_ref(conv_code)
@@ -693,6 +714,7 @@ class FirestoreAutoAssignStore(AutoAssignStore):
                     next_index=next_index,
                     pool_key=pool_key,
                     now=current,
+                    extra_cursors=extra_cursors,
                 ),
                 merge=True,
             )

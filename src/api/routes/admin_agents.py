@@ -31,6 +31,8 @@ class AgentCreateRequest(BaseModel):
     target: int = Field(..., ge=0)
     min: int = Field(..., ge=0)
     max: int = Field(..., ge=0)
+    # Overflow group (group B): receives the turns of agents who hit their cap.
+    overflow: Optional[bool] = None
 
 
 class AgentUpdateRequest(BaseModel):
@@ -42,6 +44,7 @@ class AgentUpdateRequest(BaseModel):
     target: int = Field(..., ge=0)
     min: int = Field(..., ge=0)
     max: int = Field(..., ge=0)
+    overflow: Optional[bool] = None  # omitted -> existing value is kept
 
 
 class AgentDeleteRequest(BaseModel):
@@ -179,6 +182,7 @@ def create_agent(
             target=req.target,
             min_value=req.min,
             max_value=req.max,
+            overflow=req.overflow,
         )
     except Exception as exc:  # pragma: no cover - converted below
         _handle_admin_error(exc)
@@ -208,6 +212,7 @@ def patch_agent(
             target=req.target,
             min_value=req.min,
             max_value=req.max,
+            overflow=req.overflow,
         )
     except Exception as exc:  # pragma: no cover - converted below
         _handle_admin_error(exc)

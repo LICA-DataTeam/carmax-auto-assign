@@ -99,6 +99,7 @@ def _normalize_agent(raw: Dict[str, object], team_name: str) -> Dict[str, object
         "target": raw.get("target"),
         "min": raw.get("min"),
         "max": raw.get("max"),
+        "overflow": auto_assign._parse_active_flag(raw.get("overflow", False)),
     }
 
 
@@ -215,6 +216,7 @@ def create_agent(
     target: int,
     min_value: int,
     max_value: int,
+    overflow: Optional[bool] = None,
 ) -> AgentMutationResult:
     team_name = (team or "").strip() or UNASSIGNED_TEAM
     normalized_key = agent_key.strip()
@@ -260,6 +262,7 @@ def create_agent(
             "target": int(target),
             "min": int(min_value),
             "max": int(max_value),
+            "overflow": bool(overflow) if overflow is not None else False,
         }
         team_entry.setdefault("agents", []).append(agent)
 
@@ -305,6 +308,7 @@ def update_agent(
     target: int,
     min_value: int,
     max_value: int,
+    overflow: Optional[bool] = None,
 ) -> AgentMutationResult:
     normalized_key = target_agent_key.strip()
     if not normalized_key:
@@ -370,6 +374,9 @@ def update_agent(
         agent["target"] = int(target)
         agent["min"] = int(min_value)
         agent["max"] = int(max_value)
+        if overflow is not None:
+            # Left out of the PATCH -> keep whatever the roster already has.
+            agent["overflow"] = bool(overflow)
 
         _validate_payload(updated)
         new_version = current_version + 1

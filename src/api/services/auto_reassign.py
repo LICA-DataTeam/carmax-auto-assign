@@ -283,6 +283,7 @@ async def run_auto_reassign(
                 agent_id=plan.get("agent_id"),
                 reason=plan.get("reason"),
                 department_id=department_id,
+                overflow_from=plan.get("overflow_from"),
             )
 
             try:
@@ -318,6 +319,7 @@ async def run_auto_reassign(
                     max_assignments=plan.get("max_assignments"),
                 ),
                 pool_key=str(plan.get("pool_key") or "full_pool"),
+                extra_cursors=plan.get("extra_cursors"),
                 now=now,
             )
             log_bq_event(
@@ -328,6 +330,7 @@ async def run_auto_reassign(
                 reason=commit.get("reason"),
                 previous_agent_id=current_agent,
                 department_id=department_id,
+                overflow_from=plan.get("overflow_from"),
             )
             results.append(commit)
     finally:
