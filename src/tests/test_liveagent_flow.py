@@ -247,6 +247,7 @@ async def test_liveagent_success_flow(monkeypatch: pytest.MonkeyPatch) -> None:
         "reason": "round_robin",
         "day_key": "2026-03-13",
         "next_index": 0,
+        "max_assignments": 12,
     }
     monkeypatch.setattr(auto_assign, "plan_next_assignment", lambda **kwargs: plan)
 
@@ -285,6 +286,8 @@ async def test_liveagent_success_flow(monkeypatch: pytest.MonkeyPatch) -> None:
     assert committed["conv_code"] == "c3"
     assert committed["agent_id"] == "a1"
     assert committed["day_key"] == "2026-03-13"
+    # The chosen agent's own configured cap is what the store enforces.
+    assert committed["max_assignments"] == 12
 
 
 @pytest.mark.anyio

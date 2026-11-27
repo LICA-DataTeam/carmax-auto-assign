@@ -74,7 +74,17 @@ class AutoAssignStore:
         cutoff: datetime,
         max_reassign_count: int,
         statuses: List[str],
+        not_before: Optional[datetime] = None,
     ) -> List[Dict[str, object]]:
+        """Bot-made assignments (status "assigned") whose last action is in
+        [not_before, cutoff], that have been reassigned fewer than
+        max_reassign_count times, and whose last known ticket_status (if
+        recorded) is still eligible. Oldest first."""
+        raise NotImplementedError
+
+    def mark_ticket_status(self, conv_code: str, ticket_status: Optional[str]) -> None:
+        """Remember the last LiveAgent status seen for a ticket so later
+        reassign scans can skip it without another LiveAgent call."""
         raise NotImplementedError
 
     def commit_reassign(
@@ -92,6 +102,54 @@ class AutoAssignStore:
         now: Optional[datetime] = None,
     ) -> Dict[str, object]:
         raise NotImplementedError
+
+
+def _as_datetime(value: object) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def _is_reassign_candidate(
+    record: Dict[str, object],
+    *,
+    cutoff: datetime,
+    max_reassign_count: int,
+    statuses: List[str],
+    not_before: Optional[datetime],
+) -> bool:
+    # Only tickets this service assigned. "already_assigned" records are tickets a
+    # human (or LiveAgent) had already assigned - never bounce those.
+    if record.get("status") != "assigned":
+        return False
+    ticket_status = record.get("ticket_status")
+    if ticket_status is not None and statuses and str(ticket_status) not in statuses:
+        return False
+    if int(record.get("reassign_count", 0) or 0) >= max_reassign_count:
+        return False
+    ts = _as_datetime(
+        record.get("last_action_at") or record.get("last_reassign_at") or record.get("assigned_at")
+    )
+    if ts is None:
+        return False
+    if ts > cutoff:
+        return False
+    if not_before is not None and ts < not_before:
+        return False
+    return True
+
+
+def _sort_oldest_first(records: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    def _key(record: Dict[str, object]):
+        ts = _as_datetime(record.get("last_action_at") or record.get("assigned_at"))
+        return ts.timestamp() if ts else 0.0
+
+    return sorted(records, key=_key)
 
 
 def _state_path() -> Path:
@@ -198,16 +256,17 @@ class FileAutoAssignStore(AutoAssignStore):
             daily = state.setdefault("daily", {})
             day_state = daily.setdefault(date_key, {"last_index": -1, "counts": {}})
             counts = day_state.setdefault("counts", {})
-            if max_assignments is not None:
-                current_count = int(counts.get(agent_id, 0))
-                if current_count >= max_assignments:
-                    return {
-                        "status": "no_eligible_agents",
-                        "conv_code": conv_code,
-                        "agent_id": None,
-                        "reason": "quota_reached",
-                    }
-                counts[agent_id] = current_count + 1
+            current_count = int(counts.get(agent_id, 0))
+            if max_assignments is not None and current_count >= max_assignments:
+                return {
+                    "status": "no_eligible_agents",
+                    "conv_code": conv_code,
+                    "agent_id": None,
+                    "reason": "quota_reached",
+                }
+            # Every assignment counts toward the agent's single daily total, even
+            # when the cap is not enforced (direct / owner_override).
+            counts[agent_id] = current_count + 1
 
             if next_index is not None:
                 cursor = self._pool_cursor(day_state, pool_key)
@@ -240,30 +299,32 @@ class FileAutoAssignStore(AutoAssignStore):
         cutoff: datetime,
         max_reassign_count: int,
         statuses: List[str],
+        not_before: Optional[datetime] = None,
     ) -> List[Dict[str, object]]:
         with self._lock:
             state = self._load_state()
             assignments = state.get("assignments") or {}
-            results: List[Dict[str, object]] = []
-            for record in assignments.values():
-                ticket_status = record.get("ticket_status")
-                if ticket_status is not None:
-                    status = str(ticket_status or "")
-                    if status not in statuses:
-                        continue
-                reassign_count = int(record.get("reassign_count", 0) or 0)
-                if reassign_count >= max_reassign_count:
-                    continue
-                ts_raw = record.get("last_action_at") or record.get("last_reassign_at") or record.get("assigned_at")
-                if not ts_raw:
-                    continue
-                try:
-                    ts = datetime.fromisoformat(str(ts_raw))
-                except Exception:
-                    continue
-                if ts <= cutoff:
-                    results.append(record)
-            return results
+            results = [
+                record
+                for record in assignments.values()
+                if _is_reassign_candidate(
+                    record,
+                    cutoff=cutoff,
+                    max_reassign_count=max_reassign_count,
+                    statuses=statuses,
+                    not_before=not_before,
+                )
+            ]
+            return _sort_oldest_first(results)
+
+    def mark_ticket_status(self, conv_code: str, ticket_status: Optional[str]) -> None:
+        with self._lock:
+            state = self._load_state()
+            record = (state.get("assignments") or {}).get(conv_code)
+            if not record:
+                return
+            record["ticket_status"] = ticket_status
+            self._save_state(state)
 
     def commit_reassign(
         self,
@@ -292,25 +353,6 @@ class FileAutoAssignStore(AutoAssignStore):
                     "reason": "missing_assignment",
                 }
 
-            daily = state.setdefault("daily", {})
-            day_state = daily.setdefault(date_key, {"last_index": -1, "counts": {}})
-            counts = day_state.setdefault("counts", {})
-            if max_assignments is not None:
-                current_count = int(counts.get(new_agent_id, 0))
-                if current_count >= max_assignments:
-                    return {
-                        "status": "no_eligible_agents",
-                        "conv_code": conv_code,
-                        "agent_id": None,
-                        "reason": "quota_reached",
-                    }
-                counts[new_agent_id] = current_count + 1
-
-            if next_index is not None:
-                cursor = self._pool_cursor(day_state, pool_key)
-                cursor["last_index"] = next_index
-                cursor["last_agent_id"] = new_agent_id
-
             reassign_count = int(existing.get("reassign_count", 0) or 0) + 1
             if reassign_count > max_reassign_count:
                 return {
@@ -319,6 +361,24 @@ class FileAutoAssignStore(AutoAssignStore):
                     "agent_id": None,
                     "reason": "reassign_limit_reached",
                 }
+
+            daily = state.setdefault("daily", {})
+            day_state = daily.setdefault(date_key, {"last_index": -1, "counts": {}})
+            counts = day_state.setdefault("counts", {})
+            current_count = int(counts.get(new_agent_id, 0))
+            if max_assignments is not None and current_count >= max_assignments:
+                return {
+                    "status": "no_eligible_agents",
+                    "conv_code": conv_code,
+                    "agent_id": None,
+                    "reason": "quota_reached",
+                }
+            counts[new_agent_id] = current_count + 1
+
+            if next_index is not None:
+                cursor = self._pool_cursor(day_state, pool_key)
+                cursor["last_index"] = next_index
+                cursor["last_agent_id"] = new_agent_id
             record = {
                 **existing,
                 "status": "assigned",
@@ -339,6 +399,39 @@ class FileAutoAssignStore(AutoAssignStore):
                 "agent_id": new_agent_id,
                 "reason": reason,
             }
+
+
+def _daily_updates(
+    firestore,
+    *,
+    date_key: str,
+    agent_id: str,
+    next_index: Optional[int],
+    pool_key: str,
+    now: datetime,
+) -> Dict[str, object]:
+    """Payload for txn.set(daily_ref, ..., merge=True).
+
+    Must use NESTED dicts. set(merge=True) does not expand dotted keys, so the
+    previous {"counts.<id>": Increment(1)} created a literal top-level field
+    named "counts.<id>" - the `counts` map stayed empty, the daily cap was never
+    enforced, and team-pool cursors ("pools.<key>.last_index") never persisted.
+    """
+    updates: Dict[str, object] = {
+        "date": date_key,
+        "updated_at": now.isoformat(),
+        # Always counted: one shared daily total per agent across all pools.
+        "counts": {agent_id: firestore.Increment(1)},
+    }
+    if next_index is not None:
+        if pool_key == FULL_POOL_KEY:
+            updates["last_index"] = int(next_index)
+            updates["last_agent_id"] = agent_id
+        else:
+            updates["pools"] = {
+                pool_key: {"last_index": int(next_index), "last_agent_id": agent_id}
+            }
+    return updates
 
 
 class FirestoreAutoAssignStore(AutoAssignStore):
@@ -469,21 +562,18 @@ class FirestoreAutoAssignStore(AutoAssignStore):
                         "reason": "quota_reached",
                     }
 
-            updates = {
-                "date": date_key,
-                "updated_at": current.isoformat(),
-            }
-            if max_assignments is not None:
-                updates[f"counts.{agent_id}"] = firestore.Increment(1)
-            if next_index is not None:
-                if pool_key == FULL_POOL_KEY:
-                    updates["last_index"] = int(next_index)
-                    updates["last_agent_id"] = agent_id
-                else:
-                    updates[f"pools.{pool_key}.last_index"] = int(next_index)
-                    updates[f"pools.{pool_key}.last_agent_id"] = agent_id
-
-            txn.set(daily_ref, updates, merge=True)
+            txn.set(
+                daily_ref,
+                _daily_updates(
+                    firestore,
+                    date_key=date_key,
+                    agent_id=agent_id,
+                    next_index=next_index,
+                    pool_key=pool_key,
+                    now=current,
+                ),
+                merge=True,
+            )
 
             record = {
                 "status": "assigned",
@@ -512,25 +602,33 @@ class FirestoreAutoAssignStore(AutoAssignStore):
         cutoff: datetime,
         max_reassign_count: int,
         statuses: List[str],
+        not_before: Optional[datetime] = None,
     ) -> List[Dict[str, object]]:
-        query = (
-            self._client.collection(self._assignments_collection)
-            .where("reassign_count", "<", max_reassign_count)
-            .where("last_action_at", "<=", cutoff)
+        if max_reassign_count <= 0:
+            return []
+        # Range on a single field only (auto single-field index; no composite
+        # index needed). The lower bound keeps the scan to recent tickets so
+        # enabling reassign never sweeps up the whole assignment history.
+        query = self._client.collection(self._assignments_collection).where(
+            "last_action_at", "<=", cutoff
         )
-        results = [doc.to_dict() for doc in query.stream()]
-        if not statuses:
-            return results
-        filtered = []
-        for record in results:
-            ticket_status = record.get("ticket_status")
-            if ticket_status is None:
-                filtered.append(record)
-                continue
-            status = str(ticket_status or "")
-            if status in statuses:
-                filtered.append(record)
-        return filtered
+        if not_before is not None:
+            query = query.where("last_action_at", ">=", not_before)
+        results = [
+            record
+            for record in (doc.to_dict() or {} for doc in query.stream())
+            if _is_reassign_candidate(
+                record,
+                cutoff=cutoff,
+                max_reassign_count=max_reassign_count,
+                statuses=statuses,
+                not_before=not_before,
+            )
+        ]
+        return _sort_oldest_first(results)
+
+    def mark_ticket_status(self, conv_code: str, ticket_status: Optional[str]) -> None:
+        self._assignment_ref(conv_code).set({"ticket_status": ticket_status}, merge=True)
 
     def commit_reassign(
         self,
@@ -586,21 +684,18 @@ class FirestoreAutoAssignStore(AutoAssignStore):
                         "reason": "quota_reached",
                     }
 
-            updates = {
-                "date": date_key,
-                "updated_at": current.isoformat(),
-            }
-            if max_assignments is not None:
-                updates[f"counts.{new_agent_id}"] = firestore.Increment(1)
-            if next_index is not None:
-                if pool_key == FULL_POOL_KEY:
-                    updates["last_index"] = int(next_index)
-                    updates["last_agent_id"] = new_agent_id
-                else:
-                    updates[f"pools.{pool_key}.last_index"] = int(next_index)
-                    updates[f"pools.{pool_key}.last_agent_id"] = new_agent_id
-
-            txn.set(daily_ref, updates, merge=True)
+            txn.set(
+                daily_ref,
+                _daily_updates(
+                    firestore,
+                    date_key=date_key,
+                    agent_id=new_agent_id,
+                    next_index=next_index,
+                    pool_key=pool_key,
+                    now=current,
+                ),
+                merge=True,
+            )
 
             record = {
                 **existing,

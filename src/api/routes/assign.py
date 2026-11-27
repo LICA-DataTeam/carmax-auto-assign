@@ -217,6 +217,7 @@ async def assign(
                         next_index=plan.get("next_index"),
                         pool_key=str(plan.get("pool_key") or auto_assign.FULL_POOL_KEY),
                         bypass_quota=bool(plan.get("bypass_quota", False)),
+                        max_assignments=plan.get("max_assignments"),
                     )
         except Exception as exc:
             log_event(

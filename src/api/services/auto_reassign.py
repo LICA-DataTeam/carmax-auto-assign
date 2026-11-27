@@ -18,10 +18,52 @@ from src.integrations.liveagent import LiveAgentClient, extract_private_message_
 logger = get_logger(__name__)
 
 TIMEZONE = "Asia/Manila"
-REASSIGN_AFTER_MINUTES = int(os.getenv("REASSIGN_AFTER_MINUTES", "10"))
-REASSIGN_MAX_ATTEMPTS = int(os.getenv("REASSIGN_MAX_ATTEMPTS", "1"))
-REASSIGN_ELIGIBLE_STATUSES = os.getenv("REASSIGN_ELIGIBLE_STATUSES", "C,A")
-REASSIGN_STATUS = os.getenv("LIVEAGENT_REASSIGN_STATUS", os.getenv("LIVEAGENT_ASSIGN_STATUS", "N"))
+
+# Read per run (not at import) so a Cloud Run env change or a test override is
+# always the value in effect.
+#   REASSIGN_AFTER_MINUTES      minutes without action before a ticket is reassigned
+#   REASSIGN_MAX_ATTEMPTS       max times one ticket may be reassigned (0 = disabled)
+#   REASSIGN_ELIGIBLE_STATUSES  LiveAgent ticket statuses that count as "unanswered"
+#                               (N = New - what auto-assign sets on assignment)
+#   REASSIGN_MAX_AGE_MINUTES    ignore tickets whose last action is older than this,
+#                               so enabling reassign never sweeps up old history
+#   REASSIGN_MAX_PER_RUN        cap on tickets processed per /auto-reassign call
+DEFAULT_AFTER_MINUTES = 10
+DEFAULT_MAX_ATTEMPTS = 1
+DEFAULT_ELIGIBLE_STATUSES = "C,A"
+DEFAULT_MAX_AGE_MINUTES = 120
+DEFAULT_MAX_PER_RUN = 50
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        log_event(logger, "auto_reassign_invalid_env", name=name, value=raw)
+        return default
+
+
+def _after_minutes() -> int:
+    return _env_int("REASSIGN_AFTER_MINUTES", DEFAULT_AFTER_MINUTES, minimum=1)
+
+
+def _max_attempts() -> int:
+    return _env_int("REASSIGN_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS)
+
+
+def _max_age_minutes() -> int:
+    return _env_int("REASSIGN_MAX_AGE_MINUTES", DEFAULT_MAX_AGE_MINUTES, minimum=1)
+
+
+def _max_per_run() -> int:
+    return _env_int("REASSIGN_MAX_PER_RUN", DEFAULT_MAX_PER_RUN, minimum=1)
+
+
+def _reassign_status() -> str:
+    return os.getenv("LIVEAGENT_REASSIGN_STATUS", os.getenv("LIVEAGENT_ASSIGN_STATUS", "N"))
 
 
 @dataclass
@@ -33,7 +75,8 @@ class ReassignResult:
 
 
 def _eligible_statuses() -> List[str]:
-    return [item.strip() for item in REASSIGN_ELIGIBLE_STATUSES.split(",") if item.strip()]
+    raw = os.getenv("REASSIGN_ELIGIBLE_STATUSES", DEFAULT_ELIGIBLE_STATUSES)
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def _now() -> datetime:
@@ -88,17 +131,24 @@ async def run_auto_reassign(
 ) -> Dict[str, object]:
     request_id = request_id or uuid.uuid4().hex
     now = _now()
-    cutoff = now - timedelta(minutes=REASSIGN_AFTER_MINUTES)
+    after_minutes = _after_minutes()
+    max_attempts = _max_attempts()
+    cutoff = now - timedelta(minutes=after_minutes)
+    not_before = now - timedelta(minutes=max(_max_age_minutes(), after_minutes))
     statuses = _eligible_statuses()
     store = get_store()
 
-    candidates = store.list_stale_assignments(
-        cutoff=cutoff,
-        max_reassign_count=REASSIGN_MAX_ATTEMPTS,
-        statuses=statuses,
-    )
-    if limit is not None:
-        candidates = candidates[: max(0, int(limit))]
+    if max_attempts <= 0:
+        candidates: List[Dict[str, object]] = []
+    else:
+        candidates = store.list_stale_assignments(
+            cutoff=cutoff,
+            max_reassign_count=max_attempts,
+            statuses=statuses,
+            not_before=not_before,
+        )
+    run_cap = _max_per_run() if limit is None else max(0, int(limit))
+    candidates = candidates[:run_cap]
 
     results: List[Dict[str, object]] = []
     log_bq_event(
@@ -106,7 +156,7 @@ async def run_auto_reassign(
         request_id=request_id,
         limit=limit,
         candidate_count=len(candidates),
-        cutoff_minutes=REASSIGN_AFTER_MINUTES,
+        cutoff_minutes=after_minutes,
     )
     if not candidates:
         return {
@@ -141,6 +191,17 @@ async def run_auto_reassign(
 
             ticket_status = getattr(ticket, "status", None)
             if ticket_status not in statuses:
+                # Answered / resolved etc. Record it so later scans skip this
+                # ticket without another LiveAgent call.
+                try:
+                    store.mark_ticket_status(conv_code, ticket_status)
+                except Exception as exc:
+                    log_event(
+                        logger,
+                        "auto_reassign_mark_status_failed",
+                        conv_code=conv_code,
+                        error=str(exc),
+                    )
                 log_event(
                     logger,
                     "auto_reassign_skip_status",
@@ -212,7 +273,7 @@ async def run_auto_reassign(
 
             payload = AssignTicketRequest(
                 agent_id=str(plan.get("agent_id")),
-                status=REASSIGN_STATUS or None,
+                status=_reassign_status() or None,
             )
             log_bq_event(
                 "auto_reassign_decision",
@@ -244,7 +305,6 @@ async def run_auto_reassign(
                 )
                 continue
 
-            bypass_quota = bool(plan.get("bypass_quota", False))
             commit = store.commit_reassign(
                 conv_code=conv_code,
                 new_agent_id=str(plan.get("agent_id")),
@@ -252,8 +312,11 @@ async def run_auto_reassign(
                 reason="reassign_timeout",
                 date_key=str(plan.get("day_key")),
                 next_index=plan.get("next_index"),
-                max_reassign_count=REASSIGN_MAX_ATTEMPTS,
-                max_assignments=None if bypass_quota else auto_assign.MAX_ASSIGNMENTS_PER_AGENT,
+                max_reassign_count=max_attempts,
+                max_assignments=auto_assign.effective_max_assignments(
+                    bypass_quota=bool(plan.get("bypass_quota", False)),
+                    max_assignments=plan.get("max_assignments"),
+                ),
                 pool_key=str(plan.get("pool_key") or "full_pool"),
                 now=now,
             )
