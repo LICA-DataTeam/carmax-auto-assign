@@ -10,7 +10,6 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import pytest
-from fastapi import BackgroundTasks
 from fastapi.testclient import TestClient
 
 from src.api.app import app
@@ -412,7 +411,7 @@ def test_auto_reassign_endpoint_reports_disabled(tmp_path, monkeypatch) -> None:
 
 
 # ============================================================================
-# /auto-assign schedules the sweep without delaying the response
+# /auto-assign runs the sweep inline, after the assignment, before returning
 # ============================================================================
 
 
@@ -425,55 +424,138 @@ class _Ticket:
 
 
 class _AssignClient:
+    """LiveAgent for /auto-assign: the new lead is unassigned, gets assigned."""
+
+    assigned: list = []
+
     async def get_ticket(self, ticket_id):
-        return _Ticket(agent_id="already-there")  # short path: already assigned
+        return _Ticket(agent_id=None)
+
+    async def list_agents(self):
+        return []
+
+    async def assign_ticket(self, ticket_id, payload):
+        type(self).assigned.append((ticket_id, payload.agent_id))
+        return _Ticket(agent_id=payload.agent_id)
 
     async def close(self):
         return None
 
 
+@pytest.fixture
+def webhook(tmp_path, monkeypatch):
+    """A real /auto-assign path (file store, two agents) with BigQuery events
+    and the sweep observable in one shared timeline."""
+    _setup_store(tmp_path, monkeypatch, [{"agent_key": "a1"}, {"agent_key": "b2"}])
+    monkeypatch.setenv("WEBHOOK_SECRET", "secret")
+    _AssignClient.assigned = []
+    monkeypatch.setattr(assign_route, "LiveAgentClient", _AssignClient)
+    timeline = []
+    monkeypatch.setattr(assign_route, "log_bq_event", lambda event, **f: timeline.append(("bq", event)))
+    return timeline
+
+
+async def _post_assign(conv_code="c1"):
+    return await assign_route.assign(conv_code=conv_code, agent_id=None, x_cmx_auto_assign_secret="secret")
+
+
 @pytest.mark.anyio
-async def test_assign_response_is_not_delayed_by_sweep(monkeypatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "secret")
-    monkeypatch.setattr(auto_assign, "get_existing_assignment", lambda conv_code: None)
-    monkeypatch.setattr(auto_assign, "record_existing_assignment", lambda **kw: None)
-    monkeypatch.setattr(assign_route, "LiveAgentClient", _AssignClient)
+async def test_sweep_runs_inside_the_request_after_assignment_is_logged(webhook, monkeypatch) -> None:
+    timeline = webhook
+
+    def _sweep():
+        # Inside the request: the new lead is already assigned and logged.
+        assert _AssignClient.assigned == [("c1", "a1")]
+        timeline.append(("sweep", "run"))
+        return {"status": "ok"}
+
+    monkeypatch.setattr(reassign_sweep, "maybe_run_sweep", _sweep)
+    response = await _post_assign()
+
+    assert response.status == "assigned" and response.agent_id == "a1"
+    assert ("sweep", "run") in timeline  # it ran before assign() returned
+    assert timeline.index(("bq", "auto_assign_success")) < timeline.index(("sweep", "run"))
+    assert timeline[-1] == ("sweep", "run")  # nothing logged for the lead after it
+
+
+def test_webhook_over_http_awaits_sweep(webhook, monkeypatch) -> None:
     swept = []
-
-    def _slow_sweep():
-        time.sleep(2)
-        swept.append(1)
-
-    monkeypatch.setattr(reassign_sweep, "maybe_run_sweep", _slow_sweep)
-
-    tasks = BackgroundTasks()
-    started = time.perf_counter()
-    response = await assign_route.assign(
-        conv_code="c1", agent_id=None, x_cmx_auto_assign_secret="secret", background_tasks=tasks
-    )
-    elapsed = time.perf_counter() - started
-
-    assert response.status == "already_assigned"
-    assert elapsed < 0.5  # the 2s sweep did not run inline
-    assert swept == []  # not started before the response
-    assert [task.func for task in tasks.tasks] == [_slow_sweep]
-
-
-def test_assign_webhook_runs_sweep_after_response(monkeypatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "secret")
-    monkeypatch.setattr(auto_assign, "get_existing_assignment", lambda conv_code: None)
-    monkeypatch.setattr(auto_assign, "record_existing_assignment", lambda **kw: None)
-    monkeypatch.setattr(assign_route, "LiveAgentClient", _AssignClient)
-    swept = []
-    monkeypatch.setattr(reassign_sweep, "maybe_run_sweep", lambda: swept.append(1))
-
+    monkeypatch.setattr(reassign_sweep, "maybe_run_sweep", lambda: swept.append(1) or {"status": "ok"})
     response = TestClient(app).post(
-        "/auto-assign",
-        data={"conv_code": "c1"},
-        headers={"X-CMX-Auto-Assign-Secret": "secret"},
+        "/auto-assign", data={"conv_code": "c1"}, headers={"X-CMX-Auto-Assign-Secret": "secret"}
     )
     assert response.status_code == 200
-    assert swept == [1]  # FastAPI injected BackgroundTasks and ran it
+    assert response.json()["agent_id"] == "a1"
+    assert swept == [1]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["sweep_raises", "inline_wrapper_raises", "settings_raise"])
+async def test_sweep_errors_never_affect_the_assign_response(webhook, monkeypatch, failure) -> None:
+    baseline = await _post_assign("baseline")
+
+    if failure == "sweep_raises":
+        def _boom():
+            raise RuntimeError("sweep exploded")
+
+        monkeypatch.setattr(reassign_sweep, "maybe_run_sweep", _boom)
+    elif failure == "inline_wrapper_raises":
+        async def _boom_async():
+            raise RuntimeError("wrapper exploded")
+
+        monkeypatch.setattr(reassign_sweep, "run_inline_sweep", _boom_async)
+    else:
+        def _settings_boom(use_cache=True):
+            raise RuntimeError("settings exploded")
+
+        monkeypatch.setattr(reassign_settings, "load_settings", _settings_boom)
+
+    response = await _post_assign("c2")
+    assert response.status == baseline.status == "assigned"
+    assert response.reason == baseline.reason
+    assert response.agent_id == "b2"  # normal rotation continued
+    assert get_store().get_assignment("c2")["agent_id"] == "b2"
+
+
+@pytest.mark.anyio
+async def test_non_winning_requests_return_immediately(webhook, monkeypatch) -> None:
+    monkeypatch.setattr(reassign_settings, "load_settings", lambda use_cache=True: ON)
+    runs = []
+
+    async def _fake_run(**kwargs):
+        runs.append(kwargs)
+        return {"status": "ok", "checked": 0, "reassigned": 0, "results": []}
+
+    monkeypatch.setattr(auto_reassign, "run_auto_reassign", _fake_run)
+    await _post_assign("c1")  # wins the lease
+    reassign_sweep.reset_local_state()  # next request lands on "another instance"
+    started = time.perf_counter()
+    await _post_assign("c2")
+    assert time.perf_counter() - started < 1.0
+    assert len(runs) == 1  # the second request did not sweep
+
+
+def test_traffic_sweep_caps_tickets_and_sets_budget(sweep_env, monkeypatch) -> None:
+    _, runs = sweep_env
+    reassign_sweep.maybe_run_sweep()
+    assert runs[0]["limit"] == 10  # ON.max_per_run is 50 -> traffic cap 10
+    deadline = runs[0]["deadline"]
+    assert 9 < deadline - time.monotonic() <= 10.0
+
+    smaller = ReassignSettings(**{**ON.to_dict(), "eligible_statuses": ("N",), "max_per_run": 3})
+    monkeypatch.setattr(reassign_settings, "load_settings", lambda use_cache=True: smaller)
+    reassign_sweep.reset_local_state()
+    sweep_env[0].now = T0 + timedelta(seconds=61)
+    reassign_sweep.maybe_run_sweep()
+    assert runs[1]["limit"] == 3
+
+
+def test_auto_reassign_endpoint_has_no_traffic_budget_or_cap(sweep_env, monkeypatch) -> None:
+    _, runs = sweep_env
+    monkeypatch.setenv("WEBHOOK_SECRET", "secret")
+    TestClient(app).post("/auto-reassign", headers={"X-CMX-Auto-Assign-Secret": "secret"})
+    assert runs[0]["deadline"] is None
+    assert runs[0]["limit"] is None  # settings.max_per_run applies inside the sweep
 
 
 # ============================================================================
@@ -664,3 +746,81 @@ def test_max_attempts_and_max_age_respected(tmp_path, monkeypatch, liveagent) ->
     again = asyncio.run(auto_reassign.run_auto_reassign(settings=one_attempt))
     assert again["checked"] == 0
     assert len(liveagent.assigned) == 1
+
+
+# ============================================================================
+# Time budget (real sweep, slow / hanging LiveAgent)
+# ============================================================================
+
+
+class _SlowLiveAgent(_FakeLiveAgent):
+    delay = 0.0
+
+    async def get_ticket(self, conv_code):
+        await asyncio.sleep(type(self).delay)
+        return type(self).tickets[conv_code]
+
+
+@pytest.fixture
+def slow_liveagent(monkeypatch):
+    _SlowLiveAgent.tickets, _SlowLiveAgent.assigned, _SlowLiveAgent.offline = {}, [], []
+    monkeypatch.setattr(auto_reassign, "LiveAgentClient", _SlowLiveAgent)
+    monkeypatch.setattr(auto_reassign, "_now", lambda: T0)
+    return _SlowLiveAgent
+
+
+def test_sweep_stops_when_budget_runs_out_and_resumes_next_time(tmp_path, monkeypatch, slow_liveagent) -> None:
+    _setup_store(tmp_path, monkeypatch, [{"agent_key": "a1"}, {"agent_key": "b2"}])
+    for i in range(5):
+        _bot_assign(f"c{i}", "a1", minutes_ago=6 + i)
+        slow_liveagent.tickets[f"c{i}"] = _Ticket("N", "a1")
+    slow_liveagent.delay = 0.3
+
+    started = time.monotonic()
+    result = asyncio.run(auto_reassign.run_auto_reassign(settings=ON, deadline=started + 0.5))
+    elapsed = time.monotonic() - started
+
+    assert result["budget_exhausted"] is True
+    assert elapsed < 0.9  # stopped at the budget, not after all 5 x 0.3s
+    assert 1 <= result["reassigned"] < 5
+    assert result["checked"] == result["reassigned"]  # no half-processed ticket counted
+    moved = {conv for conv, _ in slow_liveagent.assigned}
+
+    # Untouched leads are still candidates; the next sweep (no budget) finishes them.
+    slow_liveagent.delay = 0.0
+    rest = asyncio.run(auto_reassign.run_auto_reassign(settings=ON))
+    assert rest["budget_exhausted"] is False
+    assert moved | {conv for conv, _ in slow_liveagent.assigned} == {f"c{i}" for i in range(5)}
+    assert len(slow_liveagent.assigned) == 5  # nobody moved twice
+
+
+def test_hanging_liveagent_call_is_cut_off_at_the_budget(tmp_path, monkeypatch, slow_liveagent) -> None:
+    _setup_store(tmp_path, monkeypatch, [{"agent_key": "a1"}, {"agent_key": "b2"}])
+    _bot_assign("c1", "a1")
+    slow_liveagent.tickets["c1"] = _Ticket("N", "a1")
+    slow_liveagent.delay = 30  # would block far past the budget
+
+    started = time.monotonic()
+    result = asyncio.run(auto_reassign.run_auto_reassign(settings=ON, deadline=started + 0.3))
+    assert time.monotonic() - started < 1.0
+    assert result["budget_exhausted"] is True
+    assert result["checked"] == 0
+    assert slow_liveagent.assigned == []
+    assert get_store().get_assignment("c1")["agent_id"] == "a1"  # unchanged
+
+
+def test_budget_exhaustion_releases_the_lease(tmp_path, monkeypatch, slow_liveagent) -> None:
+    _setup_store(tmp_path, monkeypatch, [{"agent_key": "a1"}, {"agent_key": "b2"}])
+    _bot_assign("c1", "a1")
+    slow_liveagent.tickets["c1"] = _Ticket("N", "a1")
+    slow_liveagent.delay = 30
+    monkeypatch.setattr(reassign_settings, "load_settings", lambda use_cache=True: ON)
+    monkeypatch.setattr(reassign_sweep, "TRAFFIC_TIME_BUDGET_SECONDS", 0.3)
+    monkeypatch.setattr(reassign_sweep, "_now", lambda: T0)
+
+    started = time.monotonic()
+    result = reassign_sweep.maybe_run_sweep()
+    assert time.monotonic() - started < 1.5
+    assert result["budget_exhausted"] is True
+    lease = json.loads(Path(get_store_path()).read_text(encoding="utf-8"))["reassign_lease"]
+    assert lease["holder"] is None and lease["lease_until"] is None

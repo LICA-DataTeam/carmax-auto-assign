@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -26,6 +28,28 @@ TIMEZONE = "Asia/Manila"
 
 # Reason logged/recorded when a lead is moved to a new agent.
 REASSIGNED_REASON = "reassigned"
+
+
+class _BudgetExhausted(Exception):
+    """The sweep's time budget ran out; stop before touching another ticket."""
+
+
+async def _bounded(coro, deadline: Optional[float]):
+    """Await a READ-ONLY step within the sweep's remaining time budget.
+
+    Only used for steps with no side effects (fetching the agent list, a
+    ticket, its messages), so cancelling one on timeout is always safe. The
+    move itself (LiveAgent assign + store commit) is never cut off midway."""
+    if deadline is None:
+        return await coro
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        coro.close()
+        raise _BudgetExhausted()
+    try:
+        return await asyncio.wait_for(coro, timeout=remaining)
+    except asyncio.TimeoutError as exc:
+        raise _BudgetExhausted() from exc
 
 
 def _reassign_status() -> str:
@@ -90,10 +114,15 @@ async def run_auto_reassign(
     limit: Optional[int] = None,
     request_id: Optional[str] = None,
     settings: Optional[reassign_settings.ReassignSettings] = None,
+    deadline: Optional[float] = None,
 ) -> Dict[str, object]:
     """One sweep over stale, still-unanswered leads this service assigned.
 
-    Does not check `enabled` or the lease - see reassign_sweep for that."""
+    Does not check `enabled` or the lease - see reassign_sweep for that.
+    `deadline` (time.monotonic()) is an optional time budget: no new ticket is
+    started after it, and pending read-only LiveAgent calls are cut off at it.
+    The result then has budget_exhausted=True and the rest waits for the next
+    sweep."""
     request_id = request_id or uuid.uuid4().hex
     settings = settings or reassign_settings.load_settings(use_cache=False)
     now = _now()
@@ -129,19 +158,36 @@ async def run_auto_reassign(
             "status": "ok",
             "checked": 0,
             "reassigned": 0,
+            "budget_exhausted": False,
             "results": results,
         }
 
+    budget_exhausted = False
+    processed = 0
     client = LiveAgentClient()
     try:
-        offline_agent_ids = await _fetch_offline_agent_ids(client, request_id)
+        try:
+            offline_agent_ids = await _bounded(
+                _fetch_offline_agent_ids(client, request_id), deadline
+            )
+        except _BudgetExhausted:
+            budget_exhausted = True
+            candidates = []
         for record in candidates:
+            if deadline is not None and time.monotonic() >= deadline:
+                budget_exhausted = True
+                break
             conv_code = str(record.get("conv_code") or "")
             if not conv_code:
                 continue
+            processed += 1
 
             try:
-                ticket = await client.get_ticket(conv_code)
+                ticket = await _bounded(client.get_ticket(conv_code), deadline)
+            except _BudgetExhausted:
+                processed -= 1
+                budget_exhausted = True
+                break
             except Exception as exc:
                 log_event(logger, "auto_reassign_ticket_fetch_failed", conv_code=conv_code, error=str(exc))
                 log_bq_event(
@@ -240,7 +286,15 @@ async def run_auto_reassign(
                 and plan.get("reason") == "team_pool"
                 and plan.get("owner_overrides_configured")
             ):
-                fallback_owner_name = await _resolve_owner_override_fallback_name(client, conv_code)
+                try:
+                    fallback_owner_name = await _bounded(
+                        _resolve_owner_override_fallback_name(client, conv_code), deadline
+                    )
+                except _BudgetExhausted:
+                    # Nothing changed for this ticket yet - leave it for the next sweep.
+                    processed -= 1
+                    budget_exhausted = True
+                    break
                 if fallback_owner_name:
                     fallback_plan = auto_assign.plan_next_assignment(
                         now=now,
@@ -350,9 +404,18 @@ async def run_auto_reassign(
         await client.close()
 
     reassigned = len([r for r in results if r.get("status") == "reassigned"])
+    if budget_exhausted:
+        log_event(
+            logger,
+            "auto_reassign_budget_exhausted",
+            request_id=request_id,
+            processed=processed,
+            candidates=len(candidates),
+        )
     return {
         "status": "ok",
-        "checked": len(candidates),
+        "checked": processed,
         "reassigned": reassigned,
+        "budget_exhausted": budget_exhausted,
         "results": results,
     }

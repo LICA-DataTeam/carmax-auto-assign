@@ -3,7 +3,7 @@ import time
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Form, Header, HTTPException, Query
+from fastapi import APIRouter, Form, Header, HTTPException, Query
 from pydantic import BaseModel
 
 from src.api.models import AssignTicketRequest
@@ -88,7 +88,6 @@ async def assign(
     x_cmx_auto_assign_secret: Optional[str] = Header(
         None, alias="X-CMX-Auto-Assign-Secret"
     ),
-    background_tasks: BackgroundTasks = None,
 ) -> AutoAssignResponse:
     _require_secret(x_cmx_auto_assign_secret, conv_code=conv_code)
     ticket = LiveAgentTicketWebHook(
@@ -264,17 +263,22 @@ async def assign(
         reason=result.get("reason"),
         department_id=department_id,
     )
-    if background_tasks is not None:
-        # Runs after the response is sent (in a worker thread), so the webhook
-        # reply is never delayed. It checks `enabled` and the shared 60s lease
-        # itself and is a no-op otherwise.
-        background_tasks.add_task(reassign_sweep.maybe_run_sweep)
-    return AutoAssignResponse(
+    response = AutoAssignResponse(
         status=str(result.get("status")),
         conv_code=ticket.conv_code,
         agent_id=result.get("agent_id"),
         reason=result.get("reason"),
     )
+    # The new lead is fully assigned and logged; the response is built and
+    # can't change from here. Sweep stale leads now, while this request still
+    # has CPU (Cloud Run throttles after the response). Only the request that
+    # wins the shared 60s lease sweeps (up to ~10s / 10 tickets); every other
+    # request falls straight through. Sweep errors never affect the response.
+    try:
+        await reassign_sweep.run_inline_sweep()
+    except Exception as exc:  # run_inline_sweep already never raises; belt and braces
+        log_event(logger, "auto_reassign_sweep_failed", conv_code=ticket.conv_code, error=str(exc))
+    return response
 
 
 @router.post("/auto-reassign")
