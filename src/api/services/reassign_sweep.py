@@ -79,8 +79,12 @@ async def run_sweep_with_lease(
     if not settings.enabled:
         return {"status": "disabled", "checked": 0, "reassigned": 0, "results": []}
 
-    store = get_store()
     now = _now()
+    if not settings.is_active_at(now):
+        # Outside office hours: skipped exactly like disabled (no lease taken).
+        return {"status": "outside_active_hours", "checked": 0, "reassigned": 0, "results": []}
+
+    store = get_store()
     holder = f"{_INSTANCE_ID}:{uuid.uuid4().hex[:8]}"
     lease = store.try_acquire_reassign_lease(
         holder=holder,
@@ -141,6 +145,8 @@ def maybe_run_sweep() -> Dict[str, object]:
         return {"status": "disabled"}
 
     now = _now()
+    if not settings.is_active_at(now):
+        return {"status": "outside_active_hours"}
     with _LOCAL_LOCK:
         if _LOCAL_RUNNING:
             return {"status": "busy"}
@@ -176,7 +182,7 @@ async def run_inline_sweep() -> Dict[str, object]:
         log_event(logger, "auto_reassign_sweep_failed", error=str(exc))
         result = {"status": "error"}
     status = result.get("status")
-    if status not in {"disabled", "throttled_local", "busy"}:
+    if status not in {"disabled", "outside_active_hours", "throttled_local", "busy"}:
         log_event(
             logger,
             "auto_reassign_inline_sweep",

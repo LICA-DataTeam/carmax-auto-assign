@@ -13,8 +13,9 @@ import threading
 import time
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from src.api.services import agent_config_admin
 from src.api.services.agent_config_admin import NotFoundError, ValidationError, VersionConflictError
@@ -22,6 +23,7 @@ from src.api.utils.logging import get_logger, log_event
 
 logger = get_logger(__name__)
 
+TIMEZONE = "Asia/Manila"
 AGENTS_SOURCE_ENV = "AGENTS_SOURCE"
 SETTINGS_COLLECTION_ENV = "FIRESTORE_COLLECTION_AGENT_CONFIG"  # default: app_config
 SETTINGS_DOC_ENV = "FIRESTORE_DOC_REASSIGN_SETTINGS"  # default: reassign_settings
@@ -44,7 +46,12 @@ FIELDS = (
     "eligible_statuses",
     "max_age_minutes",
     "max_per_run",
+    "active_from",
+    "active_to",
 )
+# Optional office-hours window ("HH:MM", Asia/Manila). Both unset = no restriction.
+# An explicit null in the Firestore doc means "cleared" (not "use the env var").
+WINDOW_FIELDS = ("active_from", "active_to")
 
 # NotFoundError is re-exported so routes can map every admin error the same way.
 __all__ = [
@@ -67,6 +74,8 @@ class ReassignSettings:
     eligible_statuses: Tuple[str, ...] = DEFAULT_ELIGIBLE_STATUSES
     max_age_minutes: int = DEFAULT_MAX_AGE_MINUTES
     max_per_run: int = DEFAULT_MAX_PER_RUN
+    active_from: Optional[str] = None
+    active_to: Optional[str] = None
     # Where each field's value came from: "firestore" | "env" | "default".
     sources: Dict[str, str] = field(default_factory=dict, compare=False)
 
@@ -75,6 +84,29 @@ class ReassignSettings:
         data.pop("sources", None)
         data["eligible_statuses"] = list(self.eligible_statuses)
         return data
+
+    def is_active_at(self, now: datetime) -> bool:
+        """True when a sweep may run at `now` (converted to Asia/Manila).
+
+        No window (both unset) -> always. Start inclusive, end exclusive, and
+        a window that ends before it starts (e.g. 22:00-06:00) spans midnight.
+        A half-set window (only possible via env / a hand-edited doc; PATCH
+        rejects it) is ignored rather than blocking reassign."""
+        if self.active_from is None and self.active_to is None:
+            return True
+        start, end = _to_time(self.active_from), _to_time(self.active_to)
+        if start is None or end is None or start == end:
+            log_event(
+                logger,
+                "reassign_settings_window_ignored",
+                active_from=self.active_from,
+                active_to=self.active_to,
+            )
+            return True
+        local = now.astimezone(ZoneInfo(TIMEZONE)).time().replace(second=0, microsecond=0)
+        if start < end:
+            return start <= local < end
+        return local >= start or local < end
 
 
 # --- parsing ------------------------------------------------------------------
@@ -102,6 +134,27 @@ def _parse_int(value: Any, *, minimum: int) -> Optional[int]:
     return parsed if parsed >= minimum else None
 
 
+def _parse_hhmm(value: Any) -> Optional[str]:
+    """"9:00" / "09:00" -> "09:00"; anything else -> None."""
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().split(":")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts) or len(parts[1]) != 2:
+        return None
+    hours, minutes = int(parts[0]), int(parts[1])
+    if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+        return None
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def _to_time(value: Optional[str]) -> Optional[dt_time]:
+    parsed = _parse_hhmm(value) if value is not None else None
+    if parsed is None:
+        return None
+    hours, minutes = parsed.split(":")
+    return dt_time(int(hours), int(minutes))
+
+
 def _parse_statuses(value: Any) -> Optional[Tuple[str, ...]]:
     if isinstance(value, str):
         items = value.split(",")
@@ -120,6 +173,8 @@ _PARSERS = {
     "eligible_statuses": _parse_statuses,
     "max_age_minutes": lambda v: _parse_int(v, minimum=1),
     "max_per_run": lambda v: _parse_int(v, minimum=1),
+    "active_from": _parse_hhmm,
+    "active_to": _parse_hhmm,
 }
 
 _ENV_NAMES = {
@@ -129,6 +184,8 @@ _ENV_NAMES = {
     "eligible_statuses": "REASSIGN_ELIGIBLE_STATUSES",
     "max_age_minutes": "REASSIGN_MAX_AGE_MINUTES",
     "max_per_run": "REASSIGN_MAX_PER_RUN",
+    "active_from": "REASSIGN_ACTIVE_FROM",
+    "active_to": "REASSIGN_ACTIVE_TO",
 }
 
 _DEFAULTS = {
@@ -138,6 +195,8 @@ _DEFAULTS = {
     "eligible_statuses": DEFAULT_ELIGIBLE_STATUSES,
     "max_age_minutes": DEFAULT_MAX_AGE_MINUTES,
     "max_per_run": DEFAULT_MAX_PER_RUN,
+    "active_from": None,
+    "active_to": None,
 }
 
 
@@ -146,6 +205,9 @@ def _resolve(doc: Optional[Dict[str, Any]]) -> ReassignSettings:
     sources: Dict[str, str] = {}
     for name in FIELDS:
         parser = _PARSERS[name]
+        if name in WINDOW_FIELDS and doc is not None and name in doc and doc.get(name) is None:
+            values[name], sources[name] = None, "firestore"  # explicitly cleared
+            continue
         if doc is not None and name in doc:
             parsed = parser(doc.get(name))
             if parsed is not None:
@@ -251,6 +313,9 @@ def _validate_changes(changes: Dict[str, Any]) -> Dict[str, Any]:
         raise ValidationError(f"Unknown reassign setting(s): {', '.join(sorted(unknown))}")
     cleaned: Dict[str, Any] = {}
     for name, value in changes.items():
+        if name in WINDOW_FIELDS and value is None:
+            cleaned[name] = None  # clear the window bound
+            continue
         parsed = _PARSERS[name](value)
         if parsed is None:
             raise ValidationError(f"Invalid value for {name}")
@@ -293,6 +358,10 @@ def update_settings(
         merged.update(cleaned)
         if merged["max_age_minutes"] < merged["after_minutes"]:
             raise ValidationError("max_age_minutes must be >= after_minutes")
+        if (merged["active_from"] is None) != (merged["active_to"] is None):
+            raise ValidationError("active_from and active_to must be set (or cleared) together")
+        if merged["active_from"] is not None and merged["active_from"] == merged["active_to"]:
+            raise ValidationError("active_from and active_to must differ")
 
         now_iso = datetime.now(timezone.utc).isoformat()
         updated = {

@@ -19,6 +19,8 @@ class ReassignSettingsView(BaseModel):
     eligible_statuses: List[str]
     max_age_minutes: int
     max_per_run: int
+    active_from: Optional[str] = None
+    active_to: Optional[str] = None
 
 
 class ReassignConfigResponse(BaseModel):
@@ -40,6 +42,9 @@ class ReassignUpdateRequest(BaseModel):
     eligible_statuses: Optional[List[str]] = Field(None, min_length=1)
     max_age_minutes: Optional[int] = Field(None, ge=1, le=10080)
     max_per_run: Optional[int] = Field(None, ge=1, le=500)
+    # Office hours, Asia/Manila "HH:MM". Set both, or send both as null to clear.
+    active_from: Optional[str] = Field(None, description='e.g. "09:00"; null clears')
+    active_to: Optional[str] = Field(None, description='e.g. "18:00"; null clears')
 
 
 class ReassignMutationResponse(BaseModel):
@@ -61,7 +66,13 @@ def patch_reassign_settings(
     changes: Dict[str, Any] = req.model_dump(
         exclude_unset=True, exclude={"expected_version", "change_reason"}
     )
-    changes = {key: value for key, value in changes.items() if value is not None}
+    # null means "leave unchanged" - except for the window bounds, where an
+    # explicit null clears the restriction.
+    changes = {
+        key: value
+        for key, value in changes.items()
+        if value is not None or key in reassign_settings.WINDOW_FIELDS
+    }
     try:
         config = reassign_settings.update_settings(
             expected_version=req.expected_version,
