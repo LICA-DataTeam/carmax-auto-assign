@@ -9,9 +9,12 @@ from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from src.api.utils.logging import get_logger, log_event
-from src.api.services.auto_assign_store import FULL_POOL_KEY, get_store
+from src.api.services.auto_assign_store import FULL_POOL_KEY, OVERFLOW_POOL_KEY, get_store
 
 
+# Fallback daily cap for an agent whose config has no usable `max`. Each agent's
+# own `max` (set via /admin/agents) is the real cap; it is one shared total per
+# agent per day across every pool (full_pool, team:<dept>, direct, owner_override).
 MAX_ASSIGNMENTS_PER_AGENT = 30
 TIMEZONE = "Asia/Manila"
 CONFIG_ENV = "AUTO_ASSIGN_CONFIG_PATH"
@@ -42,6 +45,9 @@ class Agent:
     agent_id: str
     agent_name: str
     active: bool
+    max_assignments: int = MAX_ASSIGNMENTS_PER_AGENT
+    # Overflow group (group B): takes the full_pool turns of agents at their cap.
+    overflow: bool = False
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,21 @@ def _config_path() -> Path:
     if override:
         return Path(override)
     return _repo_root() / "config" / "carmax_agents.json"
+
+
+def _parse_max_assignments(value: object) -> int:
+    """Agent's configured daily `max`. Missing, blank, negative or non-numeric
+    values fall back to MAX_ASSIGNMENTS_PER_AGENT (read at call time so it stays
+    patchable). 0 is honoured: the agent gets no round-robin assignments."""
+    if value is None or isinstance(value, bool):
+        return MAX_ASSIGNMENTS_PER_AGENT
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return MAX_ASSIGNMENTS_PER_AGENT
+    if parsed < 0:
+        return MAX_ASSIGNMENTS_PER_AGENT
+    return parsed
 
 
 def _parse_active_flag(value: object) -> bool:
@@ -167,6 +188,8 @@ def _parse_agents_payload(payload: Dict[str, object], *, source: str) -> List[Ag
                     agent_id=agent_id,
                     agent_name=agent_name,
                     active=_parse_active_flag(item.get("active", True)),
+                    max_assignments=_parse_max_assignments(item.get("max")),
+                    overflow=_parse_active_flag(item.get("overflow", False)),
                 )
             )
 
@@ -354,9 +377,147 @@ def _select_round_robin(
         agent = agents[idx]
         if agent.agent_id in exclude_agent_ids:
             continue
-        if counts.get(agent.agent_id, 0) < MAX_ASSIGNMENTS_PER_AGENT:
+        if int(counts.get(agent.agent_id, 0) or 0) < agent.max_assignments:
             return idx, agent
     return None
+
+
+def _all_unavailable(agents: List[Agent], exclude_agent_ids: set[str]) -> bool:
+    """True when no agent in `agents` could take a ticket regardless of quota -
+    the pool is empty or every member is excluded (offline / current owner)."""
+    return all(agent.agent_id in exclude_agent_ids for agent in agents)
+
+
+def _plan_full_pool(
+    *,
+    active_agents: List[Agent],
+    exclude_agent_ids: set[str],
+    store,
+    day_key: str,
+    success_reason: str,
+    unavailable_reason: str,
+    extra: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """Shared round-robin with overflow to group B.
+
+    Walks the rotation from the cursor as before. When the agent whose turn it
+    is is available (not excluded) but at their daily cap, that turn goes to the
+    next available overflow agent (overflow=True, under their own cap) on a
+    separate `overflow` cursor, and the main cursor advances past the capped
+    agent - so everyone else keeps exactly the turns they'd have had if the
+    capped agent were still taking leads. If no overflow agent can take it, the
+    walk continues to the next eligible agent (pre-overflow behavior). Excluded
+    (offline / current owner) agents are skipped and never trigger overflow.
+    With no overflow agents configured this is identical to the plain walk."""
+    day_state = store.get_daily_state(day_key, pool_key=FULL_POOL_KEY)
+    counts = dict(day_state.get("counts") or {})
+    last_index = int(day_state.get("last_index", -1))
+
+    overflow_agents = [agent for agent in active_agents if agent.overflow]
+    overflow_pick: Optional[Tuple[int, Agent]] = None
+    overflow_checked = False
+
+    total = len(active_agents)
+    start = (last_index + 1) % total if total and last_index >= 0 else 0
+    for offset in range(total):
+        idx = (start + offset) % total
+        agent = active_agents[idx]
+        if agent.agent_id in exclude_agent_ids:
+            continue
+        if int(counts.get(agent.agent_id, 0) or 0) < agent.max_assignments:
+            return {
+                "status": "candidate",
+                "agent_id": agent.agent_id,
+                "reason": success_reason,
+                "day_key": day_key,
+                "next_index": idx,
+                "pool_key": FULL_POOL_KEY,
+                "bypass_quota": False,
+                "max_assignments": agent.max_assignments,
+                **(extra or {}),
+            }
+        # Available but at cap: this turn belongs to the overflow group.
+        if overflow_agents and not overflow_checked:
+            overflow_checked = True
+            overflow_state = store.get_daily_state(day_key, pool_key=OVERFLOW_POOL_KEY)
+            overflow_pick = _select_round_robin(
+                overflow_agents,
+                counts,
+                int(overflow_state.get("last_index", -1)),
+                exclude_agent_ids=exclude_agent_ids,
+            )
+        if overflow_pick is not None:
+            overflow_index, overflow_agent = overflow_pick
+            log_event(
+                logger,
+                "auto_assign_overflow",
+                agent_id=overflow_agent.agent_id,
+                overflow_from=agent.agent_id,
+            )
+            return {
+                "status": "candidate",
+                "agent_id": overflow_agent.agent_id,
+                "reason": "overflow_round_robin",
+                "day_key": day_key,
+                "next_index": idx,  # main rotation moves past the capped agent
+                "pool_key": FULL_POOL_KEY,
+                "extra_cursors": {OVERFLOW_POOL_KEY: overflow_index},
+                "bypass_quota": False,
+                "max_assignments": overflow_agent.max_assignments,
+                "overflow_from": agent.agent_id,
+                **(extra or {}),
+            }
+        # No overflow agent free: keep walking, as before this rule existed.
+
+    reason = (
+        unavailable_reason
+        if _all_unavailable(active_agents, exclude_agent_ids)
+        else "quota_reached"
+    )
+    return {
+        "status": "no_eligible_agents",
+        "agent_id": None,
+        "reason": reason,
+        **(extra or {}),
+    }
+
+
+def _fallback_to_full_pool(
+    *,
+    department_id: str,
+    team_agents: List[Agent],
+    active_agents: List[Agent],
+    exclude_agent_ids: set[str],
+    store,
+    day_key: str,
+) -> Dict[str, object]:
+    """A department's own agents can't take the ticket (offline, inactive, or at
+    their daily cap): hand it to the shared full_pool round-robin instead of
+    leaving it unassigned. Offline / current-owner exclusions still apply."""
+    team_cause = (
+        "no_available_team_agents"
+        if _all_unavailable(team_agents, exclude_agent_ids)
+        else "team_quota_reached"
+    )
+    log_event(
+        logger,
+        "auto_assign_team_fallback_full_pool",
+        department_id=department_id,
+        team_cause=team_cause,
+    )
+    plan = _plan_full_pool(
+        active_agents=active_agents,
+        exclude_agent_ids=exclude_agent_ids,
+        store=store,
+        day_key=day_key,
+        success_reason="team_fallback_full_pool",
+        unavailable_reason="no_available_team_agents",
+        extra={"fallback_from": department_id, "team_cause": team_cause},
+    )
+    if plan["status"] != "candidate" and team_cause == "no_available_team_agents":
+        # Report the team-side cause; the full pool being exhausted too is secondary.
+        plan["reason"] = "no_available_team_agents"
+    return plan
 
 
 def get_existing_assignment(conv_code: str) -> Optional[Dict[str, object]]:
@@ -436,15 +597,20 @@ def plan_next_assignment(
             if target_agent is None or target_agent.agent_id in exclude_agent_ids:
                 log_event(
                     logger,
-                    "auto_assign_direct_no_alternative_agent",
+                    "auto_assign_direct_agent_unavailable",
                     department_id=department_id,
                     agent_id=target_agent_id,
                 )
-                return {
-                    "status": "no_eligible_agents",
-                    "agent_id": None,
-                    "reason": "direct_no_alternative_agent",
-                }
+                return _fallback_to_full_pool(
+                    department_id=department_id,
+                    team_agents=[target_agent] if target_agent else [],
+                    active_agents=active_agents,
+                    exclude_agent_ids=exclude_agent_ids,
+                    store=store,
+                    day_key=day_key,
+                )
+            # Direct-page leads count toward the agent's daily total but are not
+            # blocked by it (bypass_quota): the page owner always gets their page.
             return {
                 "status": "candidate",
                 "agent_id": target_agent.agent_id,
@@ -453,6 +619,7 @@ def plan_next_assignment(
                 "next_index": None,
                 "pool_key": f"direct:{department_id}",
                 "bypass_quota": True,
+                "max_assignments": target_agent.max_assignments,
             }
 
         if route.mode == ROUTING_MODE_TEAM_POOL:
@@ -482,6 +649,7 @@ def plan_next_assignment(
                             "next_index": None,
                             "pool_key": f"owner_override:{department_id}",
                             "bypass_quota": True,
+                            "max_assignments": override_agent.max_assignments,
                         }
                     # Matched agent is inactive/excluded - the team has other members,
                     # so fall through to normal round-robin instead of failing safe.
@@ -493,11 +661,14 @@ def plan_next_assignment(
             last_index = int(day_state.get("last_index", -1))
             pick = _select_round_robin(pool_agents, counts, last_index, exclude_agent_ids=exclude_agent_ids)
             if pick is None:
-                return {
-                    "status": "no_eligible_agents",
-                    "agent_id": None,
-                    "reason": "quota_reached",
-                }
+                return _fallback_to_full_pool(
+                    department_id=department_id,
+                    team_agents=pool_agents,
+                    active_agents=active_agents,
+                    exclude_agent_ids=exclude_agent_ids,
+                    store=store,
+                    day_key=day_key,
+                )
             next_index, chosen = pick
             return {
                 "status": "candidate",
@@ -507,6 +678,7 @@ def plan_next_assignment(
                 "next_index": next_index,
                 "pool_key": pool_key,
                 "bypass_quota": False,
+                "max_assignments": chosen.max_assignments,
                 "owner_overrides_configured": bool(route.owner_overrides),
             }
 
@@ -519,28 +691,14 @@ def plan_next_assignment(
             "reason": "no_active_agents",
         }
 
-    day_state = store.get_daily_state(day_key, pool_key=FULL_POOL_KEY)
-    counts = dict(day_state.get("counts") or {})
-    last_index = int(day_state.get("last_index", -1))
-
-    pick = _select_round_robin(active_agents, counts, last_index, exclude_agent_ids=exclude_agent_ids)
-    if pick is None:
-        return {
-            "status": "no_eligible_agents",
-            "agent_id": None,
-            "reason": "quota_reached",
-        }
-
-    next_index, chosen = pick
-    return {
-        "status": "candidate",
-        "agent_id": chosen.agent_id,
-        "reason": "round_robin",
-        "day_key": day_key,
-        "next_index": next_index,
-        "pool_key": FULL_POOL_KEY,
-        "bypass_quota": False,
-    }
+    return _plan_full_pool(
+        active_agents=active_agents,
+        exclude_agent_ids=exclude_agent_ids,
+        store=store,
+        day_key=day_key,
+        success_reason="round_robin",
+        unavailable_reason="no_available_agents",
+    )
 
 def commit_assignment(
     *,
@@ -552,6 +710,8 @@ def commit_assignment(
     next_index: Optional[int] = None,
     pool_key: str = FULL_POOL_KEY,
     bypass_quota: bool = False,
+    max_assignments: Optional[int] = None,
+    extra_cursors: Optional[Dict[str, int]] = None,
 ) -> Dict[str, object]:
     current = now.astimezone(ZoneInfo(TIMEZONE)) if now else datetime.now(ZoneInfo(TIMEZONE))
     store = get_store()
@@ -563,10 +723,23 @@ def commit_assignment(
         reason=reason,
         date_key=day_key,
         next_index=next_index,
-        max_assignments=None if bypass_quota else MAX_ASSIGNMENTS_PER_AGENT,
+        max_assignments=effective_max_assignments(
+            bypass_quota=bypass_quota, max_assignments=max_assignments
+        ),
         pool_key=pool_key,
+        extra_cursors=extra_cursors,
         now=current,
     )
+
+
+def effective_max_assignments(*, bypass_quota: bool, max_assignments: Optional[int]) -> Optional[int]:
+    """Cap the store enforces at commit time. None means "count it, but don't
+    block" (direct / owner_override); the daily count is always incremented."""
+    if bypass_quota:
+        return None
+    if max_assignments is None:
+        return MAX_ASSIGNMENTS_PER_AGENT
+    return int(max_assignments)
 
 
 def assign_round_robin(
@@ -636,6 +809,8 @@ def assign_round_robin(
         next_index=plan.get("next_index"),
         pool_key=str(plan.get("pool_key") or FULL_POOL_KEY),
         bypass_quota=bool(plan.get("bypass_quota", False)),
+        max_assignments=plan.get("max_assignments"),
+        extra_cursors=plan.get("extra_cursors"),
     )
     if commit.get("status") == "assigned":
         log_event(

@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -9,7 +10,10 @@ from src.api.services import auto_assign
 from src.api.services.auto_assign_store import reset_store_cache
 
 
-def _write_agents(path: Path, agent_ids: list[str]) -> None:
+def _write_agents(
+    path: Path, agent_ids: list[str], max_by_agent: Optional[dict[str, int]] = None
+) -> None:
+    max_by_agent = max_by_agent or {}
     payload = {
         "teams": [
             {
@@ -20,7 +24,7 @@ def _write_agents(path: Path, agent_ids: list[str]) -> None:
                         "agent_name": f"Agent {agent_id}",
                         "target": 30,
                         "min": 30,
-                        "max": 30,
+                        "max": max_by_agent.get(agent_id, 30),
                         "active": "true",
                     }
                     for agent_id in agent_ids
@@ -40,11 +44,12 @@ def _setup_env(
     agent_ids: list[str],
     departments: dict,
     monkeypatch: pytest.MonkeyPatch,
+    max_by_agent: Optional[dict[str, int]] = None,
 ) -> None:
     config_path = tmp_path / "agents.json"
     routing_path = tmp_path / "routing.json"
     state_path = tmp_path / "state.json"
-    _write_agents(config_path, agent_ids)
+    _write_agents(config_path, agent_ids, max_by_agent)
     _write_routing(routing_path, departments)
     monkeypatch.setenv("AUTO_ASSIGN_STORE", "file")
     monkeypatch.setenv(auto_assign.AGENTS_SOURCE_ENV, "file")
@@ -71,8 +76,8 @@ def test_direct_mode_bypasses_quota(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         ["angelo"],
         {"mqemg9w7": {"label": "Angelo", "mode": "direct", "agent_keys": ["angelo"], "active": True}},
         monkeypatch,
+        max_by_agent={"angelo": 1},
     )
-    monkeypatch.setattr(auto_assign, "MAX_ASSIGNMENTS_PER_AGENT", 1)
     now = _now_in_window()
 
     for idx in range(5):
@@ -103,7 +108,9 @@ def test_direct_mode_assigns_outside_prior_office_hours(monkeypatch: pytest.Monk
     assert result["agent_id"] == "angelo"
 
 
-def test_direct_mode_fails_safe_when_agent_inactive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_direct_mode_no_agents_anywhere_reports_team_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     _setup_env(
         tmp_path,
         [],  # no active agents at all
@@ -112,10 +119,12 @@ def test_direct_mode_fails_safe_when_agent_inactive(monkeypatch: pytest.MonkeyPa
     )
     result = auto_assign.plan_next_assignment(now=_now_in_window(), department_id="mqemg9w7")
     assert result["status"] == "no_eligible_agents"
-    assert result["reason"] == "direct_no_alternative_agent"
+    assert result["reason"] == "no_available_team_agents"
 
 
-def test_direct_mode_does_not_fall_back_to_pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_direct_mode_inactive_agent_falls_back_to_full_pool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     _setup_env(
         tmp_path,
         ["b2"],  # active agent exists but is not the department's target
@@ -123,9 +132,12 @@ def test_direct_mode_does_not_fall_back_to_pool(monkeypatch: pytest.MonkeyPatch,
         monkeypatch,
     )
     result = auto_assign.plan_next_assignment(now=_now_in_window(), department_id="mqemg9w7")
-    assert result["status"] == "no_eligible_agents"
-    assert result["reason"] == "direct_no_alternative_agent"
-    assert result["agent_id"] is None
+    assert result["status"] == "candidate"
+    assert result["reason"] == "team_fallback_full_pool"
+    assert result["agent_id"] == "b2"
+    assert result["pool_key"] == "full_pool"
+    assert result["bypass_quota"] is False
+    assert result["fallback_from"] == "mqemg9w7"
 
 
 # --- team_pool mode ----------------------------------------------------------
@@ -156,7 +168,7 @@ def test_team_pool_only_selects_within_department(monkeypatch: pytest.MonkeyPatc
     assert "c3" not in picks
 
 
-def test_team_pool_respects_quota_and_does_not_spill(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_team_pool_at_cap_spills_to_full_pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _setup_env(
         tmp_path,
         ["a1", "b2", "c3"],
@@ -169,8 +181,8 @@ def test_team_pool_respects_quota_and_does_not_spill(monkeypatch: pytest.MonkeyP
             }
         },
         monkeypatch,
+        max_by_agent={"a1": 1, "b2": 1, "c3": 1},
     )
-    monkeypatch.setattr(auto_assign, "MAX_ASSIGNMENTS_PER_AGENT", 1)
     now = _now_in_window()
 
     first = auto_assign.assign_round_robin(
@@ -181,12 +193,19 @@ def test_team_pool_respects_quota_and_does_not_spill(monkeypatch: pytest.MonkeyP
     )
     assert {first["agent_id"], second["agent_id"]} == {"a1", "b2"}
 
+    # Both team members are at their cap -> the shared pool's free agent takes it.
     third = auto_assign.assign_round_robin(
         conv_code="c3", incoming_agent_id=None, now=now, department_id="p1ivd5m8"
     )
-    assert third["status"] == "no_eligible_agents"
-    assert third["reason"] == "quota_reached"
-    assert third["agent_id"] is None
+    assert third["status"] == "assigned"
+    assert third["agent_id"] == "c3"
+    assert third["reason"] == "team_fallback_full_pool"
+
+    # Everyone is capped now: a real quota hit, not an availability problem.
+    fourth = auto_assign.plan_next_assignment(now=now, department_id="p1ivd5m8")
+    assert fourth["status"] == "no_eligible_agents"
+    assert fourth["reason"] == "quota_reached"
+    assert fourth["team_cause"] == "team_quota_reached"
 
 
 def test_team_pool_and_full_pool_have_independent_cursors(
@@ -291,8 +310,8 @@ def test_team_pool_owner_override_bypasses_quota(monkeypatch: pytest.MonkeyPatch
             }
         },
         monkeypatch,
+        max_by_agent={"b2": 1},
     )
-    monkeypatch.setattr(auto_assign, "MAX_ASSIGNMENTS_PER_AGENT", 1)
     now = _now_in_window()
     plan_results = [
         auto_assign.plan_next_assignment(now=now, department_id="p1ivd5m8", owner_name="page-b2")
@@ -515,8 +534,8 @@ def test_full_pool_mapped_department_quota_cutoff(monkeypatch: pytest.MonkeyPatc
         ["a1", "b2"],
         {"o6woli37": {"label": "AutoCenter", "mode": "full_pool", "agent_keys": [], "active": True}},
         monkeypatch,
+        max_by_agent={"a1": 2, "b2": 2},
     )
-    monkeypatch.setattr(auto_assign, "MAX_ASSIGNMENTS_PER_AGENT", 2)
     now = _now_in_window()
     for idx in range(4):
         result = auto_assign.assign_round_robin(

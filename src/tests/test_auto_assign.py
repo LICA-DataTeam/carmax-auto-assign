@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -9,7 +10,10 @@ from src.api.services import auto_assign
 from src.api.services.auto_assign_store import reset_store_cache
 
 
-def _write_agents(path: Path, agent_ids: list[str]) -> None:
+def _write_agents(
+    path: Path, agent_ids: list[str], max_by_agent: Optional[dict[str, int]] = None
+) -> None:
+    max_by_agent = max_by_agent or {}
     payload = {
         "teams": [
             {
@@ -20,7 +24,7 @@ def _write_agents(path: Path, agent_ids: list[str]) -> None:
                         "agent_name": f"Agent {agent_id}",
                         "target": 30,
                         "min": 30,
-                        "max": 30,
+                        "max": max_by_agent.get(agent_id, 30),
                         "active": "true",
                     }
                     for agent_id in agent_ids
@@ -35,10 +39,15 @@ def _write_payload(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def _setup_env(tmp_path: Path, agent_ids: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+def _setup_env(
+    tmp_path: Path,
+    agent_ids: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    max_by_agent: Optional[dict[str, int]] = None,
+) -> None:
     config_path = tmp_path / "agents.json"
     state_path = tmp_path / "state.json"
-    _write_agents(config_path, agent_ids)
+    _write_agents(config_path, agent_ids, max_by_agent)
     monkeypatch.setenv("AUTO_ASSIGN_STORE", "file")
     monkeypatch.setenv(auto_assign.AGENTS_SOURCE_ENV, "file")
     monkeypatch.setenv(auto_assign.CONFIG_ENV, str(config_path))
@@ -80,8 +89,7 @@ def test_round_robin_wraparound(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 
 
 def test_quota_cutoff(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    _setup_env(tmp_path, ["a1", "b2"], monkeypatch)
-    monkeypatch.setattr(auto_assign, "MAX_ASSIGNMENTS_PER_AGENT", 2)
+    _setup_env(tmp_path, ["a1", "b2"], monkeypatch, max_by_agent={"a1": 2, "b2": 2})
     now = _now_in_window()
     for idx in range(4):
         result = auto_assign.assign_round_robin(conv_code=f"c{idx}", incoming_agent_id=None, now=now)

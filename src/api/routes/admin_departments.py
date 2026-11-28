@@ -55,6 +55,7 @@ class DepartmentPreviewResponse(BaseModel):
     reason: Optional[str] = None
     pool_key: Optional[str] = None
     bypass_quota: bool = False
+    overflow_from: Optional[str] = None
 
 
 def _to_config_response(payload: Dict[str, Any]) -> DepartmentRoutingConfigResponse:
@@ -131,6 +132,7 @@ def preview_department(
         reason=plan.get("reason"),
         pool_key=plan.get("pool_key"),
         bypass_quota=bool(plan.get("bypass_quota", False)),
+        overflow_from=plan.get("overflow_from"),
     )
 
 

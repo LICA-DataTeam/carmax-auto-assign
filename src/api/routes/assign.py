@@ -111,6 +111,7 @@ async def assign(
     )
 
     department_id: Optional[str] = None
+    overflow_from: Optional[str] = None
     existing = auto_assign.get_existing_assignment(ticket.conv_code)
     if existing:
         result = {
@@ -194,6 +195,7 @@ async def assign(
                         department_id=department_id,
                     )
                 else:
+                    overflow_from = plan.get("overflow_from")
                     assign_status = os.getenv("LIVEAGENT_ASSIGN_STATUS", "N").strip()
                     payload = AssignTicketRequest(
                         agent_id=str(plan.get("agent_id")),
@@ -207,6 +209,7 @@ async def assign(
                         agent_id=plan.get("agent_id"),
                         reason=plan.get("reason"),
                         department_id=department_id,
+                        overflow_from=overflow_from,
                     )
                     await client.assign_ticket(ticket.conv_code, payload)
                     result = auto_assign.commit_assignment(
@@ -217,6 +220,8 @@ async def assign(
                         next_index=plan.get("next_index"),
                         pool_key=str(plan.get("pool_key") or auto_assign.FULL_POOL_KEY),
                         bypass_quota=bool(plan.get("bypass_quota", False)),
+                        max_assignments=plan.get("max_assignments"),
+                        extra_cursors=plan.get("extra_cursors"),
                     )
         except Exception as exc:
             log_event(
@@ -247,6 +252,7 @@ async def assign(
         reason=result.get("reason"),
         latency_ms=latency_ms,
         department_id=department_id,
+        overflow_from=overflow_from,
     )
     log_event(
         logger,

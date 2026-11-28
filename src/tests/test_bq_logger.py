@@ -29,9 +29,10 @@ def test_bigquery_logger_inserts_rows(monkeypatch: pytest.MonkeyPatch) -> None:
         def __init__(self, project=None, credentials=None):
             self.project = project or "default-project"
 
-        def insert_rows_json(self, table_id, rows):
+        def insert_rows_json(self, table_id, rows, **kwargs):
             inserted["table_id"] = table_id
             inserted["rows"] = rows
+            inserted["kwargs"] = kwargs
             return []
 
     # Patch google.cloud.bigquery.Client before instantiation
@@ -54,3 +55,6 @@ def test_bigquery_logger_inserts_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     assert inserted["table_id"] == "test-project.auto_assign.events"
     assert inserted["rows"][0]["event"] == "evt"
     assert inserted["rows"][0]["conv_code"] == "c1"
+    # A field without a table column (e.g. overflow_from before the column is
+    # added) must be dropped, not reject the whole row.
+    assert inserted["kwargs"] == {"ignore_unknown_values": True}
