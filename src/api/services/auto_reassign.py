@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from src.api.models import AssignTicketRequest
-from src.api.services import auto_assign
+from src.api.services import auto_assign, reassign_settings
 from src.api.services.auto_assign_store import get_store
 from src.api.services.bq_logger import log_bq_event
 from src.api.utils.logging import get_logger, log_event
@@ -19,47 +19,13 @@ logger = get_logger(__name__)
 
 TIMEZONE = "Asia/Manila"
 
-# Read per run (not at import) so a Cloud Run env change or a test override is
-# always the value in effect.
-#   REASSIGN_AFTER_MINUTES      minutes without action before a ticket is reassigned
-#   REASSIGN_MAX_ATTEMPTS       max times one ticket may be reassigned (0 = disabled)
-#   REASSIGN_ELIGIBLE_STATUSES  LiveAgent ticket statuses that count as "unanswered"
-#                               (N = New - what auto-assign sets on assignment)
-#   REASSIGN_MAX_AGE_MINUTES    ignore tickets whose last action is older than this,
-#                               so enabling reassign never sweeps up old history
-#   REASSIGN_MAX_PER_RUN        cap on tickets processed per /auto-reassign call
-DEFAULT_AFTER_MINUTES = 10
-DEFAULT_MAX_ATTEMPTS = 1
-DEFAULT_ELIGIBLE_STATUSES = "C,A"
-DEFAULT_MAX_AGE_MINUTES = 120
-DEFAULT_MAX_PER_RUN = 50
+# Settings (enabled, after_minutes, max_attempts, eligible_statuses,
+# max_age_minutes, max_per_run) come from src.api.services.reassign_settings:
+# the Firestore doc edited via /admin/reassign, falling back to the REASSIGN_*
+# env vars. This module only does the sweep; callers decide whether to run it.
 
-
-def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return max(minimum, int(raw))
-    except ValueError:
-        log_event(logger, "auto_reassign_invalid_env", name=name, value=raw)
-        return default
-
-
-def _after_minutes() -> int:
-    return _env_int("REASSIGN_AFTER_MINUTES", DEFAULT_AFTER_MINUTES, minimum=1)
-
-
-def _max_attempts() -> int:
-    return _env_int("REASSIGN_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS)
-
-
-def _max_age_minutes() -> int:
-    return _env_int("REASSIGN_MAX_AGE_MINUTES", DEFAULT_MAX_AGE_MINUTES, minimum=1)
-
-
-def _max_per_run() -> int:
-    return _env_int("REASSIGN_MAX_PER_RUN", DEFAULT_MAX_PER_RUN, minimum=1)
+# Reason logged/recorded when a lead is moved to a new agent.
+REASSIGNED_REASON = "reassigned"
 
 
 def _reassign_status() -> str:
@@ -72,11 +38,6 @@ class ReassignResult:
     status: str
     agent_id: Optional[str] = None
     reason: Optional[str] = None
-
-
-def _eligible_statuses() -> List[str]:
-    raw = os.getenv("REASSIGN_ELIGIBLE_STATUSES", DEFAULT_ELIGIBLE_STATUSES)
-    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def _now() -> datetime:
@@ -128,14 +89,19 @@ async def run_auto_reassign(
     *,
     limit: Optional[int] = None,
     request_id: Optional[str] = None,
+    settings: Optional[reassign_settings.ReassignSettings] = None,
 ) -> Dict[str, object]:
+    """One sweep over stale, still-unanswered leads this service assigned.
+
+    Does not check `enabled` or the lease - see reassign_sweep for that."""
     request_id = request_id or uuid.uuid4().hex
+    settings = settings or reassign_settings.load_settings(use_cache=False)
     now = _now()
-    after_minutes = _after_minutes()
-    max_attempts = _max_attempts()
+    after_minutes = settings.after_minutes
+    max_attempts = settings.max_attempts
     cutoff = now - timedelta(minutes=after_minutes)
-    not_before = now - timedelta(minutes=max(_max_age_minutes(), after_minutes))
-    statuses = _eligible_statuses()
+    not_before = now - timedelta(minutes=max(settings.max_age_minutes, after_minutes))
+    statuses = list(settings.eligible_statuses)
     store = get_store()
 
     if max_attempts <= 0:
@@ -147,7 +113,7 @@ async def run_auto_reassign(
             statuses=statuses,
             not_before=not_before,
         )
-    run_cap = _max_per_run() if limit is None else max(0, int(limit))
+    run_cap = settings.max_per_run if limit is None else max(0, int(limit))
     candidates = candidates[:run_cap]
 
     results: List[Dict[str, object]] = []
@@ -225,12 +191,44 @@ async def run_auto_reassign(
                 )
                 continue
 
-            current_agent = getattr(ticket, "agent_id", None) or record.get("agent_id")
+            # Right before moving: the ticket must still be with the agent this
+            # service assigned. A different (or no) agent in LiveAgent means a
+            # person moved it - leave it alone for good.
+            assigned_agent = str(record.get("agent_id") or "")
+            live_agent = str(getattr(ticket, "agent_id", None) or "")
+            if not assigned_agent or live_agent != assigned_agent:
+                try:
+                    store.release_from_reassign(
+                        conv_code, reason="agent_changed", observed_agent_id=live_agent or None
+                    )
+                except Exception as exc:
+                    log_event(
+                        logger,
+                        "auto_reassign_release_failed",
+                        conv_code=conv_code,
+                        error=str(exc),
+                    )
+                log_bq_event(
+                    "auto_reassign_decision",
+                    request_id=request_id,
+                    conv_code=conv_code,
+                    status="skipped",
+                    reason="agent_changed",
+                    agent_id=live_agent or None,
+                    previous_agent_id=assigned_agent or None,
+                    ticket_status=ticket_status,
+                )
+                results.append(
+                    {"conv_code": conv_code, "status": "skipped", "reason": "agent_changed"}
+                )
+                continue
+
+            current_agent = assigned_agent
             department_id = getattr(ticket, "department_id", None)
             owner_name = getattr(ticket, "owner_name", None)
+            # Never hand it back to the agent who didn't answer, nor to anyone offline.
             exclude_agent_ids = set(offline_agent_ids)
-            if current_agent:
-                exclude_agent_ids.add(str(current_agent))
+            exclude_agent_ids.add(current_agent)
             plan = auto_assign.plan_next_assignment(
                 now=now,
                 exclude_agent_ids=exclude_agent_ids,
@@ -309,8 +307,8 @@ async def run_auto_reassign(
             commit = store.commit_reassign(
                 conv_code=conv_code,
                 new_agent_id=str(plan.get("agent_id")),
-                previous_agent_id=str(current_agent) if current_agent else None,
-                reason="reassign_timeout",
+                previous_agent_id=current_agent,
+                reason=REASSIGNED_REASON,
                 date_key=str(plan.get("day_key")),
                 next_index=plan.get("next_index"),
                 max_reassign_count=max_attempts,
@@ -322,12 +320,27 @@ async def run_auto_reassign(
                 extra_cursors=plan.get("extra_cursors"),
                 now=now,
             )
+            if commit.get("status") != "reassigned":
+                # LiveAgent already moved it but the store refused (e.g. the
+                # new agent hit their cap in a race). Logged so it's visible.
+                log_bq_event(
+                    "auto_reassign_failed",
+                    request_id=request_id,
+                    conv_code=conv_code,
+                    agent_id=plan.get("agent_id"),
+                    previous_agent_id=current_agent,
+                    reason=commit.get("reason"),
+                )
+                results.append(commit)
+                continue
             log_bq_event(
                 "auto_reassign_success",
                 request_id=request_id,
                 conv_code=conv_code,
                 agent_id=commit.get("agent_id"),
-                reason=commit.get("reason"),
+                reason=REASSIGNED_REASON,
+                status="reassigned",
+                pool_key=plan.get("pool_key"),
                 previous_agent_id=current_agent,
                 department_id=department_id,
                 overflow_from=plan.get("overflow_from"),
