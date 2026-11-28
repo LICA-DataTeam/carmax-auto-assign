@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 from src.api.models import AssignTicketRequest
 from src.api.services.bq_logger import log_bq_event
-from src.api.services import auto_assign, run_auto_reassign
+from src.api.services import auto_assign, reassign_sweep
 from src.api.utils.logging import get_logger, log_event
 from src.integrations.liveagent import LiveAgentClient, extract_private_message_page_name
 
@@ -263,12 +263,22 @@ async def assign(
         reason=result.get("reason"),
         department_id=department_id,
     )
-    return AutoAssignResponse(
+    response = AutoAssignResponse(
         status=str(result.get("status")),
         conv_code=ticket.conv_code,
         agent_id=result.get("agent_id"),
         reason=result.get("reason"),
     )
+    # The new lead is fully assigned and logged; the response is built and
+    # can't change from here. Sweep stale leads now, while this request still
+    # has CPU (Cloud Run throttles after the response). Only the request that
+    # wins the shared 60s lease sweeps (up to ~10s / 10 tickets); every other
+    # request falls straight through. Sweep errors never affect the response.
+    try:
+        await reassign_sweep.run_inline_sweep()
+    except Exception as exc:  # run_inline_sweep already never raises; belt and braces
+        log_event(logger, "auto_reassign_sweep_failed", conv_code=ticket.conv_code, error=str(exc))
+    return response
 
 
 @router.post("/auto-reassign")
@@ -278,19 +288,8 @@ async def auto_reassign(
         None, alias="X-CMX-Auto-Assign-Secret"
     ),
 ) -> dict:
+    """Manual / scheduler trigger. Same settings and same lease as the traffic
+    trigger, so the two never sweep at once; returns status "disabled" or
+    "throttled" when it doesn't run."""
     _require_secret(x_cmx_auto_assign_secret)
-    request_id = uuid.uuid4().hex
-    result = await run_auto_reassign(limit=limit, request_id=request_id)
-    log_event(
-        logger,
-        "auto_reassign_complete",
-        checked=result.get("checked"),
-        reassigned=result.get("reassigned"),
-    )
-    log_bq_event(
-        "auto_reassign_complete",
-        request_id=request_id,
-        checked=result.get("checked"),
-        reassigned=result.get("reassigned"),
-    )
-    return result
+    return await reassign_sweep.run_sweep_with_lease(trigger="endpoint", limit=limit)

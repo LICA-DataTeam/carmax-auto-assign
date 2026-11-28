@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from datetime import timedelta
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
 from src.api.utils.logging import get_logger, log_event
@@ -24,6 +24,12 @@ OVERFLOW_POOL_KEY = "overflow"
 
 ASSIGNMENTS_COLLECTION_ENV = "FIRESTORE_COLLECTION_ASSIGNMENTS"
 DAILY_COLLECTION_ENV = "FIRESTORE_COLLECTION_DAILY"
+LEASE_COLLECTION_ENV = "FIRESTORE_COLLECTION_REASSIGN_LEASE"  # default: reassign_lease
+LEASE_DOC_ID = "sweep"
+
+# Status written on an assignment record the sweep must never move again
+# (an agent other than the one we assigned now owns it in LiveAgent).
+RELEASED_STATUS = "released_from_reassign"
 FIRESTORE_PROJECT_ENV = "FIRESTORE_PROJECT_ID"
 FIRESTORE_DATABASE_ENV = "FIRESTORE_DATABASE_ID"
 FIRESTORE_CREDENTIALS_ENV = "CREDENTIALS"
@@ -90,6 +96,27 @@ class AutoAssignStore:
         reassign scans can skip it without another LiveAgent call."""
         raise NotImplementedError
 
+    def release_from_reassign(
+        self, conv_code: str, *, reason: str, observed_agent_id: Optional[str]
+    ) -> None:
+        """Take a ticket out of auto-reassign for good (e.g. a person moved it)."""
+        raise NotImplementedError
+
+    def try_acquire_reassign_lease(
+        self,
+        *,
+        holder: str,
+        now: datetime,
+        min_interval_seconds: int,
+        ttl_seconds: int,
+    ) -> Dict[str, object]:
+        """Atomically claim the right to run one reassign sweep. Returns
+        {"acquired": bool, "next_allowed_at": datetime}."""
+        raise NotImplementedError
+
+    def release_reassign_lease(self, *, holder: str, now: datetime) -> None:
+        raise NotImplementedError
+
     def commit_reassign(
         self,
         *,
@@ -146,6 +173,44 @@ def _is_reassign_candidate(
     if not_before is not None and ts < not_before:
         return False
     return True
+
+
+def lease_decision(
+    state: Optional[Dict[str, object]],
+    *,
+    holder: str,
+    now: datetime,
+    min_interval_seconds: int,
+    ttl_seconds: int,
+) -> Tuple[bool, Optional[Dict[str, object]], datetime]:
+    """Pure lease rule shared by both stores.
+
+    A sweep may start only if (a) at least `min_interval_seconds` have passed
+    since the last sweep STARTED anywhere, and (b) no other sweep still holds
+    an unexpired lease. The TTL bounds how long a stuck/throttled sweep can
+    block others. Returns (acquired, new_state_to_write, next_check_at), where
+    next_check_at is when the caller should next bother asking (a hint for the
+    per-instance gate; the lease itself is always the source of truth)."""
+    state = state or {}
+    last_started = _as_datetime(state.get("last_started_at"))
+    lease_until = _as_datetime(state.get("lease_until"))
+    current_holder = state.get("holder")
+    interval = timedelta(seconds=min_interval_seconds)
+
+    interval_ready = last_started + interval if last_started else None
+    if interval_ready is not None and now < interval_ready:
+        return False, None, interval_ready
+    if current_holder and lease_until is not None and now < lease_until:
+        # Another sweep is still running; it usually releases well before its
+        # TTL, so re-check after one interval rather than waiting out the TTL.
+        return False, None, min(lease_until, now + interval)
+
+    new_state = {
+        "holder": holder,
+        "last_started_at": now,
+        "lease_until": now + timedelta(seconds=ttl_seconds),
+    }
+    return True, new_state, now + timedelta(seconds=min_interval_seconds)
 
 
 def _sort_oldest_first(records: List[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -333,6 +398,56 @@ class FileAutoAssignStore(AutoAssignStore):
             if not record:
                 return
             record["ticket_status"] = ticket_status
+            self._save_state(state)
+
+    def release_from_reassign(
+        self, conv_code: str, *, reason: str, observed_agent_id: Optional[str]
+    ) -> None:
+        with self._lock:
+            state = self._load_state()
+            record = (state.get("assignments") or {}).get(conv_code)
+            if not record:
+                return
+            record["status"] = RELEASED_STATUS
+            record["release_reason"] = reason
+            record["observed_agent_id"] = observed_agent_id
+            self._save_state(state)
+
+    def try_acquire_reassign_lease(
+        self,
+        *,
+        holder: str,
+        now: datetime,
+        min_interval_seconds: int,
+        ttl_seconds: int,
+    ) -> Dict[str, object]:
+        with self._lock:
+            state = self._load_state()
+            acquired, new_state, next_allowed = lease_decision(
+                state.get("reassign_lease"),
+                holder=holder,
+                now=now,
+                min_interval_seconds=min_interval_seconds,
+                ttl_seconds=ttl_seconds,
+            )
+            if acquired and new_state is not None:
+                state["reassign_lease"] = {
+                    key: (value.isoformat() if isinstance(value, datetime) else value)
+                    for key, value in new_state.items()
+                }
+                self._save_state(state)
+            return {"acquired": acquired, "next_allowed_at": next_allowed}
+
+    def release_reassign_lease(self, *, holder: str, now: datetime) -> None:
+        with self._lock:
+            state = self._load_state()
+            lease = state.get("reassign_lease") or {}
+            if lease.get("holder") != holder:
+                return
+            lease["holder"] = None
+            lease["lease_until"] = None
+            lease["released_at"] = now.isoformat()
+            state["reassign_lease"] = lease
             self._save_state(state)
 
     def commit_reassign(
@@ -649,6 +764,68 @@ class FirestoreAutoAssignStore(AutoAssignStore):
 
     def mark_ticket_status(self, conv_code: str, ticket_status: Optional[str]) -> None:
         self._assignment_ref(conv_code).set({"ticket_status": ticket_status}, merge=True)
+
+    def release_from_reassign(
+        self, conv_code: str, *, reason: str, observed_agent_id: Optional[str]
+    ) -> None:
+        self._assignment_ref(conv_code).set(
+            {
+                "status": RELEASED_STATUS,
+                "release_reason": reason,
+                "observed_agent_id": observed_agent_id,
+            },
+            merge=True,
+        )
+
+    def _lease_ref(self):
+        collection = os.getenv(LEASE_COLLECTION_ENV, "reassign_lease").strip() or "reassign_lease"
+        return self._client.collection(collection).document(LEASE_DOC_ID)
+
+    def try_acquire_reassign_lease(
+        self,
+        *,
+        holder: str,
+        now: datetime,
+        min_interval_seconds: int,
+        ttl_seconds: int,
+    ) -> Dict[str, object]:
+        lease_ref = self._lease_ref()
+        transaction = self._client.transaction()
+        firestore = self._firestore
+
+        @firestore.transactional
+        def _acquire(txn):
+            snap = lease_ref.get(transaction=txn)
+            acquired, new_state, next_allowed = lease_decision(
+                snap.to_dict() if snap.exists else None,
+                holder=holder,
+                now=now,
+                min_interval_seconds=min_interval_seconds,
+                ttl_seconds=ttl_seconds,
+            )
+            if acquired and new_state is not None:
+                txn.set(lease_ref, new_state, merge=True)
+            return {"acquired": acquired, "next_allowed_at": next_allowed}
+
+        return _acquire(transaction)
+
+    def release_reassign_lease(self, *, holder: str, now: datetime) -> None:
+        lease_ref = self._lease_ref()
+        transaction = self._client.transaction()
+        firestore = self._firestore
+
+        @firestore.transactional
+        def _release(txn):
+            snap = lease_ref.get(transaction=txn)
+            if not snap.exists or (snap.to_dict() or {}).get("holder") != holder:
+                return
+            txn.set(
+                lease_ref,
+                {"holder": None, "lease_until": None, "released_at": now},
+                merge=True,
+            )
+
+        _release(transaction)
 
     def commit_reassign(
         self,
